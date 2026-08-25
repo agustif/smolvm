@@ -1,6 +1,6 @@
 # Native display helper
 
-Last verified: 2026-06-25
+Last verified: 2026-08-25
 
 This fork adds an opt-in native graphical console to SmolVM 1.2.4 without
 changing the lifecycle of machines started by the stock CLI.
@@ -46,6 +46,13 @@ Weston writes its persistent diagnostic log to `/var/log/weston.log`.
   launch.
 - libkrun provides a bounded, damage-aware framebuffer callback and virtual
   keyboard plus absolute-pointer devices.
+- Native display used to set libkrun's private software-2D GPU flag whenever a
+  scanout existed, which advertised zero 3D capsets and made Venus fail with
+  `vkCreateInstance: Found no drivers`. `--renderer software` still requests
+  that 2D path. `--graphics --renderer auto|venus` keeps Venus/DRM capsets.
+- Debian Bookworm Mesa cannot initialize Venus on Apple Silicon (16KB host
+  pages). Use `profiles/fedora-venus` plus `slp/mesa-libkrun-vulkan` for
+  `renderer_qualification=matched`.
 - `rustvncserver` exposes the framebuffer as password-protected RFB on an
   ephemeral `127.0.0.1` port.
 - A per-launch eight-character credential is returned only over

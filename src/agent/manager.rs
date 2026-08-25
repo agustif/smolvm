@@ -1509,6 +1509,7 @@ impl AgentManager {
             extra_disks: features.extra_disks,
             display_socket,
             display_transport: features.display_transport,
+            graphics_renderer: features.graphics_renderer,
         };
         let config_path = self
             .storage_disk

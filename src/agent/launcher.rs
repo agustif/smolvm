@@ -169,6 +169,8 @@ pub struct LaunchFeatures {
     pub display: bool,
     /// Presentation transport requested for the display bridge.
     pub display_transport: crate::config::GraphicsTransportIntent,
+    /// Renderer policy for virtio-gpu capsets. Software forces 2D scanout.
+    pub graphics_renderer: crate::config::GraphicsRendererIntent,
 }
 
 impl LaunchFeatures {
@@ -285,6 +287,8 @@ pub struct LaunchConfig<'a> {
     pub display_socket: Option<&'a Path>,
     /// Presentation transport requested for the display bridge.
     pub display_transport: crate::config::GraphicsTransportIntent,
+    /// Renderer policy for virtio-gpu 3D vs software scanout.
+    pub graphics_renderer: crate::config::GraphicsRendererIntent,
 }
 
 /// Launch the agent VM using libkrun.
@@ -322,6 +326,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_telemetry,
         display_socket,
         display_transport,
+        graphics_renderer,
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
@@ -398,7 +403,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
         if resources.gpu || display_socket.is_some() {
-            let virgl_flags = super::gpu_virgl_flags(display_socket.is_some());
+            let virgl_flags = super::gpu_virgl_flags_for_renderer(*graphics_renderer);
             // Size the GPU shared-memory region. Caller may override
             // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
             // default is `DEFAULT_GPU_VRAM_MIB`.
@@ -427,7 +432,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     format!("krun_set_gpu_options2 failed (ret={}). Check that virglrenderer is installed.", ret),
                 ));
             }
-            tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+            if graphics_renderer.software_scanout_only() {
+                tracing::info!("GPU enabled (software 2D scanout)");
+            } else {
+                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+            }
         }
 
         // A display backend and input devices must be installed before

@@ -31,8 +31,13 @@ pub use manager::{
     AgentManager, AgentState,
 };
 
+use crate::config::GraphicsRendererIntent;
+
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
+
+/// libkrun private flag: 2D scanout only, no Venus/VirGL capsets.
+const SMOLVM_GPU_2D_DISPLAY: u32 = 1 << 31;
 
 /// Compute the `virgl_flags` bitmask for `krun_set_gpu_options2`.
 ///
@@ -53,25 +58,31 @@ pub const AGENT_VM_NAME: &str = "smolvm-agent";
 ///             spawned virgl_render_server instead of fork/exec-ing its own process.
 ///   bit 10 — VIRGLRENDERER_DRM             (both): DRM native context support,
 ///             required for guests to expose render nodes for accelerated clients.
-fn gpu_virgl_flags(software_display: bool) -> u32 {
+///   bit 31 — SMOLVM_GPU_2D_DISPLAY         (both): software scanout only. libkrun
+///             then advertises zero 3D capsets. Native display used to set this
+///             whenever a display socket existed, which made Venus impossible.
+fn gpu_virgl_flags(software_only: bool) -> u32 {
+    if software_only {
+        return SMOLVM_GPU_2D_DISPLAY;
+    }
     #[cfg(target_os = "linux")]
     {
-        (1 << 0)
-            | (1 << 3)
-            | (1 << 6)
-            | (1 << 9)
-            | (1 << 10)
-            | if software_display { 1 << 31 } else { 0 }
+        (1 << 0) | (1 << 3) | (1 << 6) | (1 << 9) | (1 << 10)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        (1 << 6) | (1 << 7) | (1 << 10) | if software_display { 1 << 31 } else { 0 }
+        (1 << 6) | (1 << 7) | (1 << 10)
     }
+}
+
+fn gpu_virgl_flags_for_renderer(renderer: GraphicsRendererIntent) -> u32 {
+    gpu_virgl_flags(renderer.software_scanout_only())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::gpu_virgl_flags;
+    use super::{gpu_virgl_flags, gpu_virgl_flags_for_renderer, SMOLVM_GPU_2D_DISPLAY};
+    use crate::config::GraphicsRendererIntent;
 
     #[cfg(target_os = "linux")]
     const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
@@ -82,7 +93,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
     const VIRGLRENDERER_DRM: u32 = 1 << 10;
-    const KRUN_DISPLAY_SOFTWARE_ONLY: u32 = 1 << 31;
 
     #[test]
     #[cfg(target_os = "linux")]
@@ -93,7 +103,7 @@ mod tests {
         assert_ne!(flags & VIRGLRENDERER_VENUS, 0);
         assert_ne!(flags & VIRGLRENDERER_RENDER_SERVER, 0);
         assert_ne!(flags & VIRGLRENDERER_DRM, 0);
-        assert_eq!(flags & KRUN_DISPLAY_SOFTWARE_ONLY, 0);
+        assert_eq!(flags & SMOLVM_GPU_2D_DISPLAY, 0);
     }
 
     #[test]
@@ -103,13 +113,37 @@ mod tests {
         assert_ne!(flags & VIRGLRENDERER_VENUS, 0);
         assert_ne!(flags & VIRGLRENDERER_NO_VIRGL, 0);
         assert_ne!(flags & VIRGLRENDERER_DRM, 0);
-        assert_eq!(flags & KRUN_DISPLAY_SOFTWARE_ONLY, 0);
+        assert_eq!(flags & SMOLVM_GPU_2D_DISPLAY, 0);
     }
 
     #[test]
-    fn gpu_flags_include_software_display_marker_when_requested() {
+    fn gpu_flags_software_scanout_does_not_advertise_3d_capsets() {
         let flags = gpu_virgl_flags(true);
-        assert_ne!(flags & KRUN_DISPLAY_SOFTWARE_ONLY, 0);
-        assert_ne!(flags & VIRGLRENDERER_DRM, 0);
+        assert_eq!(flags, SMOLVM_GPU_2D_DISPLAY);
+        assert_eq!(flags & VIRGLRENDERER_VENUS, 0);
+        assert_eq!(flags & VIRGLRENDERER_DRM, 0);
+    }
+
+    #[test]
+    fn native_display_with_auto_or_venus_keeps_3d_capsets() {
+        for renderer in [
+            GraphicsRendererIntent::Auto,
+            GraphicsRendererIntent::Venus,
+            GraphicsRendererIntent::Virgl,
+            GraphicsRendererIntent::NativeContext,
+        ] {
+            let flags = gpu_virgl_flags_for_renderer(renderer);
+            assert_eq!(
+                flags & SMOLVM_GPU_2D_DISPLAY,
+                0,
+                "{renderer} must not force software 2D scanout"
+            );
+            assert_ne!(flags & VIRGLRENDERER_VENUS, 0);
+            assert_ne!(flags & VIRGLRENDERER_DRM, 0);
+        }
+        assert_eq!(
+            gpu_virgl_flags_for_renderer(GraphicsRendererIntent::Software),
+            SMOLVM_GPU_2D_DISPLAY
+        );
     }
 }

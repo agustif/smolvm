@@ -1053,6 +1053,7 @@ impl RunCmd {
             extra_disks: Vec::new(),
             display: false,
             display_transport: smolvm::config::GraphicsTransportIntent::Rfb,
+            graphics_renderer: smolvm::config::GraphicsRendererIntent::Auto,
         };
 
         let freshly_started = manager
@@ -2413,7 +2414,7 @@ impl CreateCmd {
         }
         if let Some(renderer) = self.graphics_renderer {
             params.graphics = true;
-            if renderer.requests_gpu() {
+            if !renderer.software_scanout_only() {
                 params.gpu = true;
             }
             params.graphics_renderer = renderer;
@@ -2743,7 +2744,7 @@ impl StartCmd {
                 db.update_vm(&name, |record| {
                     record.graphics.enabled = true;
                     record.graphics.renderer = requested_renderer.clone();
-                    if requested_renderer.requests_gpu() {
+                    if !requested_renderer.software_scanout_only() {
                         record.gpu = Some(true);
                     }
                     record.graphics.transport = requested_transport.clone();
@@ -3478,7 +3479,7 @@ impl UpdateCmd {
                 changes.push(format!("  graphics renderer: {}", renderer));
                 r.graphics.enabled = true;
                 r.graphics.renderer = renderer.clone();
-                if renderer.requests_gpu() {
+                if !renderer.software_scanout_only() {
                     r.gpu = Some(true);
                 }
             }

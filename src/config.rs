@@ -66,7 +66,7 @@ pub struct GraphicsConfig {
 }
 
 /// Renderer policy requested by a graphics session.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphicsRendererIntent {
     /// Use the best renderer available for this machine configuration.
@@ -91,6 +91,14 @@ impl GraphicsRendererIntent {
             | GraphicsRendererIntent::Venus
             | GraphicsRendererIntent::NativeContext => true,
         }
+    }
+
+    /// Whether this renderer should advertise virtio-gpu 3D capsets.
+    ///
+    /// Software scanout uses libkrun's private 2D flag so the guest does not
+    /// see an empty Venus/VirGL ICD. Auto and accelerated intents keep 3D.
+    pub const fn software_scanout_only(&self) -> bool {
+        matches!(self, GraphicsRendererIntent::Software)
     }
 }
 
@@ -1216,8 +1224,12 @@ mod tests {
             GraphicsRendererIntent::NativeContext.to_string(),
             "native-context"
         );
+        assert!(!GraphicsRendererIntent::Auto.requests_gpu());
         assert!(GraphicsRendererIntent::Venus.requests_gpu());
         assert!(!GraphicsRendererIntent::Software.requests_gpu());
+        assert!(GraphicsRendererIntent::Software.software_scanout_only());
+        assert!(!GraphicsRendererIntent::Venus.software_scanout_only());
+        assert!(!GraphicsRendererIntent::Auto.software_scanout_only());
     }
 
     #[test]

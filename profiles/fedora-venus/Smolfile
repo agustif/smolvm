@@ -1,0 +1,83 @@
+# Known-good Fedora graphical guest for Venus/Vulkan qualification.
+#
+# Debian Bookworm Mesa cannot initialize Venus on Apple Silicon (16KB host
+# pages). Fedora 42 plus slp/mesa-libkrun-vulkan is the same stack smolvm's
+# GPU tests use for vulkaninfo without a display. Combined with a non-2D
+# virtio-gpu (renderer auto/venus), this is the guest that can reach
+# renderer_qualification=matched.
+#
+# Create:
+#   smolvm machine create --name fedora-venus \
+#     --graphics --renderer venus --transport rfb \
+#     -s profiles/fedora-venus/Smolfile
+#   smolvm machine start --name fedora-venus
+
+image = "fedora:42"
+entrypoint = ["/bin/sh", "-lc"]
+cmd = ["""
+set -eu
+rm -rf /tmp/weston-runtime
+install -d -m 700 /tmp/weston-runtime
+install -d -m 1777 /tmp/.X11-unix
+if test -z "${VK_ICD_FILENAMES:-}" && test -z "${VK_DRIVER_FILES:-}"; then
+  arch="$(uname -m)"
+  if test "$arch" = "arm64"; then
+    arch="aarch64"
+  fi
+  for icd in \
+    "/usr/share/vulkan/icd.d/virtio_icd.$arch.json" \
+    /usr/share/vulkan/icd.d/virtio_icd.aarch64.json \
+    /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do
+    if test -r "$icd"; then
+      export VK_ICD_FILENAMES="$icd"
+      break
+    fi
+  done
+fi
+exec dbus-run-session -- weston \
+  --backend=drm-backend.so \
+  --tty=1 \
+  --current-mode \
+  --idle-time=0 \
+  --xwayland \
+  --log=/var/log/weston.log
+"""]
+env = [
+    "XDG_RUNTIME_DIR=/tmp/weston-runtime",
+    "LIBSEAT_BACKEND=seatd",
+    "SEATD_SOCK=/run/seatd.sock",
+]
+
+cpus = 2
+memory = 4096
+storage = 30
+overlay = 8
+net = true
+gpu = true
+gpu_vram = 4096
+
+[dev]
+init = [
+    """command -v weston >/dev/null 2>&1 && command -v vulkaninfo >/dev/null 2>&1 && test -r /usr/share/vulkan/icd.d/virtio_icd.$(uname -m | sed 's/arm64/aarch64/').json -o -r /usr/share/vulkan/icd.d/virtio_icd.aarch64.json -o -r /usr/share/vulkan/icd.d/virtio_icd.x86_64.json || {
+  set -eu
+  arch="$(uname -m)"
+  dnf -y install dnf-plugins-core
+  if test "$arch" = aarch64 -o "$arch" = arm64; then
+    dnf copr enable -y slp/mesa-libkrun-vulkan
+  fi
+  dnf install -y --allowerasing \
+    weston xorg-x11-server-Xwayland dbus-daemon dejavu-sans-fonts \
+    adwaita-icon-theme mesa-dri-drivers mesa-vulkan-drivers vulkan-tools libinput
+}""",
+]
+
+[health]
+exec = [
+    "sh",
+    "-lc",
+    "if test -z \"${VK_ICD_FILENAMES:-}\" && test -z \"${VK_DRIVER_FILES:-}\"; then arch=\"$(uname -m)\"; if test \"$arch\" = arm64; then arch=aarch64; fi; for icd in \"/usr/share/vulkan/icd.d/virtio_icd.$arch.json\" /usr/share/vulkan/icd.d/virtio_icd.aarch64.json /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do if test -r \"$icd\"; then export VK_ICD_FILENAMES=\"$icd\"; break; fi; done; fi; test -e /dev/dri/card0 -o -e /dev/dri/renderD128 && test -d /dev/input && find /dev/input -name 'event*' | grep -q . && test -S /run/seatd.sock && { test -S /tmp/weston-runtime/wayland-0 -o -S /run/user/0/wayland-0 -o -S /run/wayland-0; } && command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/tmp/smolvm-vulkaninfo.summary 2>&1",
+]
+interval = "10s"
+timeout = "8s"
+retries = 24
+startup_grace = "30s"

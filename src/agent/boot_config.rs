@@ -8,7 +8,7 @@
 //!
 //! This module defines the serializable config passed to that subprocess.
 
-use crate::config::GraphicsTransportIntent;
+use crate::config::{GraphicsRendererIntent, GraphicsTransportIntent};
 use crate::data::disk::DiskFormat;
 use crate::data::network::PortMapping;
 use crate::data::resources::VmResources;
@@ -64,6 +64,9 @@ pub struct BootConfig {
     /// Display transport requested for this native display launch.
     #[serde(default)]
     pub display_transport: GraphicsTransportIntent,
+    /// Renderer policy for virtio-gpu 3D vs software scanout.
+    #[serde(default)]
+    pub graphics_renderer: GraphicsRendererIntent,
 }
 
 #[cfg(test)]
@@ -91,14 +94,20 @@ mod tests {
             extra_disks: Vec::new(),
             display_socket: Some("/tmp/display.sock".into()),
             display_transport: GraphicsTransportIntent::LocalShm,
+            graphics_renderer: GraphicsRendererIntent::Venus,
         };
         let mut value = serde_json::to_value(config).expect("boot config json");
         value
             .as_object_mut()
             .expect("boot config object")
             .remove("display_transport");
+        value
+            .as_object_mut()
+            .expect("boot config object")
+            .remove("graphics_renderer");
 
         let decoded: BootConfig = serde_json::from_value(value).expect("legacy boot config");
         assert_eq!(decoded.display_transport, GraphicsTransportIntent::Rfb);
+        assert_eq!(decoded.graphics_renderer, GraphicsRendererIntent::Auto);
     }
 }

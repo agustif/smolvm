@@ -665,6 +665,61 @@ protocol = "http"
     }
 
     #[test]
+    fn fedora_venus_profile_parses_and_requires_vulkaninfo() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../..")
+            .join("profiles/fedora-venus/Smolfile");
+        let sf = load(&path).expect("fedora-venus profile should parse");
+
+        assert_eq!(sf.image.as_deref(), Some("fedora:42"));
+        assert_eq!(sf.cpus, Some(2));
+        assert_eq!(sf.memory, Some(4096));
+        assert_eq!(sf.storage, Some(30));
+        assert_eq!(sf.overlay, Some(8));
+        assert_eq!(sf.net, Some(true));
+        assert_eq!(sf.gpu, Some(true));
+        assert_eq!(sf.gpu_vram, Some(4096));
+        assert!(sf.env.iter().any(|env| env == "LIBSEAT_BACKEND=seatd"));
+        assert!(sf
+            .cmd
+            .iter()
+            .any(|cmd| cmd.contains("weston") && cmd.contains("drm-backend.so")));
+        assert!(sf.cmd.iter().any(|cmd| cmd.contains("VK_ICD_FILENAMES")));
+
+        let init = sf.dev.expect("fedora-venus dev profile").init.join("\n");
+        for expected in [
+            "dnf",
+            "slp/mesa-libkrun-vulkan",
+            "weston",
+            "mesa-vulkan-drivers",
+            "vulkan-tools",
+        ] {
+            assert!(
+                init.contains(expected),
+                "fedora-venus init must mention {expected}"
+            );
+        }
+
+        let health = sf.health.expect("fedora-venus health check");
+        let health_command = health.exec.join(" ");
+        for expected in [
+            "/dev/dri",
+            "/dev/input",
+            "/run/seatd.sock",
+            "wayland-0",
+            "vulkaninfo --summary",
+        ] {
+            assert!(
+                health_command.contains(expected),
+                "fedora-venus health check must mention {expected}"
+            );
+        }
+        assert_eq!(health.timeout.as_deref(), Some("8s"));
+        assert_eq!(health.retries, Some(24));
+    }
+
+    #[test]
     fn parse_rejects_unknown_fields() {
         let err = parse("bogus_field = true");
         assert!(err.is_err());

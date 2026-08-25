@@ -634,7 +634,9 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.gpu = if params.gpu { Some(true) } else { None };
     record.graphics.enabled = params.graphics;
     record.graphics.renderer = params.graphics_renderer.clone();
-    if params.graphics_renderer.requests_gpu() {
+    if params.graphics && !params.graphics_renderer.software_scanout_only() {
+        record.gpu = Some(true);
+    } else if params.graphics_renderer.requests_gpu() {
         record.gpu = Some(true);
     }
     record.graphics.transport = params.graphics_transport.clone();
@@ -1169,6 +1171,7 @@ pub fn start_vm_named(
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         display: display_requested,
         display_transport: record.graphics.transport.clone(),
+        graphics_renderer: record.graphics.renderer.clone(),
         ..Default::default()
     }
     .with_packed_layers(
@@ -1528,6 +1531,7 @@ pub fn start_vm_default(
         smolvm::agent::LaunchFeatures {
             display: display || graphics,
             display_transport: transport.clone(),
+            graphics_renderer: renderer.clone(),
             ..Default::default()
         },
     )?;
@@ -1539,7 +1543,7 @@ pub fn start_vm_default(
             .update_vm("default", |r| {
                 r.graphics.enabled = true;
                 r.graphics.renderer = renderer.clone();
-                if renderer.requests_gpu() {
+                if !renderer.software_scanout_only() {
                     r.gpu = Some(true);
                 }
                 r.graphics.transport = transport.clone();
