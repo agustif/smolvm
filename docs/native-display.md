@@ -53,6 +53,11 @@ Weston writes its persistent diagnostic log to `/var/log/weston.log`.
 - Debian Bookworm Mesa cannot initialize Venus on Apple Silicon (16KB host
   pages). Use `profiles/fedora-venus` plus `slp/mesa-libkrun-vulkan` for
   `renderer_qualification=matched`.
+- With 3D capsets enabled, Linux virtio-gpu uses SET_SCANOUT_BLOB and may
+  send DRM fourcc formats. libkrun maps those, blits guest-backed dumb
+  buffers into RFB/local-shm, advertises only the configured EDID mode, and
+  drains the cursor virtqueue. Live strict acceptance on 2026-08-25 proved
+  non-black frames on both transports with `renderer_qualification=matched`.
 - `rustvncserver` exposes the framebuffer as password-protected RFB on an
   ephemeral `127.0.0.1` port.
 - A per-launch eight-character credential is returned only over
