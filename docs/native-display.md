@@ -136,6 +136,22 @@ SMOLVM_AGENT_ROOTFS=./target/agent-rootfs \
 ./target/release/smolvm machine start --name debian-gui --display
 ```
 
+Before running the live display acceptance suite, use the host preflight:
+
+```bash
+./tests/check_native_display_prereqs.sh
+```
+
+The check does not boot a VM. It verifies the cheap prerequisites that are
+otherwise easy to discover too late: Python and OpenSSL support for endpoint
+probes, a built `smolvm` binary, the display Smolfile, display-aware
+`libkrun`/`libkrunfw` files, an agent rootfs, and a free-disk threshold. The
+opt-in live suite runs the same preflight before creating any machine:
+
+```bash
+SMOLVM_RUN_NATIVE_DISPLAY_ACCEPTANCE=1 ./tests/run_tests.sh display
+```
+
 Packaged display helpers use `scripts/smolvm-display-wrapper.sh`, which selects
 the `agent-rootfs` beside the helper through `SMOLVM_AGENT_ROOTFS`. Rebuild and
 ship libkrun, libkrunfw, the host helper, and the agent rootfs as one validated

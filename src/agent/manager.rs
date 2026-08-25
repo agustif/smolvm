@@ -1508,6 +1508,7 @@ impl AgentManager {
             packed_layers_dir: features.packed_layers_dir,
             extra_disks: features.extra_disks,
             display_socket,
+            display_transport: features.display_transport,
         };
         let config_path = self
             .storage_disk

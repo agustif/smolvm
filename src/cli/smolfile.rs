@@ -85,6 +85,9 @@ pub fn build_create_params(
                 ssh_agent: false,
                 gpu: false,
                 gpu_vram_mib: None,
+                graphics: false,
+                graphics_renderer: smolvm::config::GraphicsRendererIntent::Auto,
+                graphics_transport: smolvm::config::GraphicsTransportIntent::Rfb,
                 dns_filter_hosts: None,
                 source_smolmachine: None,
             });
@@ -275,6 +278,9 @@ pub fn build_create_params(
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
         gpu,
         gpu_vram_mib: sf.gpu_vram,
+        graphics: false,
+        graphics_renderer: smolvm::config::GraphicsRendererIntent::Auto,
+        graphics_transport: smolvm::config::GraphicsTransportIntent::Rfb,
         dns_filter_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {

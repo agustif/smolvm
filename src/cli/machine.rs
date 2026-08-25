@@ -18,6 +18,7 @@ use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
+use smolvm::config::{GraphicsRendererIntent, GraphicsTransportIntent};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
@@ -49,6 +50,14 @@ fn is_likely_image_ref(s: &str) -> bool {
         return true;
     }
     s.contains('/') && !s.starts_with('/') && !s.starts_with("./") && !s.starts_with("../")
+}
+
+fn parse_graphics_transport(value: &str) -> Result<GraphicsTransportIntent, String> {
+    value.parse()
+}
+
+fn parse_graphics_renderer(value: &str) -> Result<GraphicsRendererIntent, String> {
+    value.parse()
 }
 
 fn resolve_egress_flags(
@@ -191,6 +200,10 @@ pub enum MachineCmd {
     /// Read the live native-display endpoint without starting the machine
     Display(DisplayCmd),
 
+    /// Inspect non-secret graphics/display status
+    #[command(subcommand)]
+    Graphics(GraphicsCmd),
+
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
@@ -259,6 +272,7 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Display(cmd) => cmd.run(),
+            MachineCmd::Graphics(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -1038,6 +1052,7 @@ impl RunCmd {
             packed_layers_dir,
             extra_disks: Vec::new(),
             display: false,
+            display_transport: smolvm::config::GraphicsTransportIntent::Rfb,
         };
 
         let freshly_started = manager
@@ -1640,6 +1655,70 @@ mod tests {
     }
 
     #[test]
+    fn create_parses_graphics_intent() {
+        let cli = TestMachineCli::parse_from(["machine", "create", "--name", "gui", "--graphics"]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.name, Some("gui".to_string()));
+        assert!(cmd.graphics);
+        assert!(!cmd.gpu);
+    }
+
+    #[test]
+    fn create_parses_graphics_transport_intent() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "gui",
+            "--transport",
+            "local-shm",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(
+            cmd.graphics_transport,
+            Some(GraphicsTransportIntent::LocalShm)
+        );
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "gui",
+            "--transport",
+            "spice",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn create_parses_graphics_renderer_intent() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "gui",
+            "--renderer",
+            "venus",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.graphics_renderer, Some(GraphicsRendererIntent::Venus));
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "gui",
+            "--renderer",
+            "warpdrive",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn create_rejects_bare_positional_name() {
         // Machine names are flags everywhere (issue #370). A bare positional —
         // the old `machine create myvm` habit — must error, not be silently
@@ -1652,13 +1731,150 @@ mod tests {
         for arguments in [
             vec!["machine", "start", "--display"],
             vec!["machine", "start", "--name", "gui", "--display"],
+            vec!["machine", "start", "--graphics"],
+            vec!["machine", "start", "--name", "gui", "--graphics"],
         ] {
             let cli = TestMachineCli::parse_from(arguments);
             let MachineCmd::Start(command) = cli.command else {
                 panic!("expected machine start command");
             };
-            assert!(command.display);
+            assert!(command.display || command.graphics);
         }
+    }
+
+    #[test]
+    fn start_parses_graphics_transport_intent() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "gui",
+            "--graphics",
+            "--transport",
+            "local-shm",
+        ]);
+        let MachineCmd::Start(command) = cli.command else {
+            panic!("expected machine start command");
+        };
+        assert!(command.graphics);
+        assert_eq!(
+            command.graphics_transport,
+            Some(GraphicsTransportIntent::LocalShm)
+        );
+    }
+
+    #[test]
+    fn start_parses_graphics_renderer_intent() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "start",
+            "--name",
+            "gui",
+            "--renderer",
+            "native-context",
+        ]);
+        let MachineCmd::Start(command) = cli.command else {
+            panic!("expected machine start command");
+        };
+        assert_eq!(
+            command.graphics_renderer,
+            Some(GraphicsRendererIntent::NativeContext)
+        );
+    }
+
+    #[test]
+    fn graphics_status_command_parses_json_flag() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "graphics", "status", "--name", "gui", "--json",
+        ]);
+        let MachineCmd::Graphics(GraphicsCmd::Status(command)) = cli.command else {
+            panic!("expected machine graphics status command");
+        };
+        assert_eq!(command.name, "gui");
+        assert!(command.json);
+    }
+
+    #[test]
+    fn update_parses_graphics_toggle() {
+        for arguments in [
+            vec!["machine", "update", "--name", "gui", "--graphics"],
+            vec!["machine", "update", "--name", "gui", "--no-graphics"],
+        ] {
+            let cli = TestMachineCli::parse_from(arguments);
+            let MachineCmd::Update(command) = cli.command else {
+                panic!("expected machine update command");
+            };
+            assert_eq!(command.name, "gui");
+            assert!(command.graphics || command.no_graphics);
+        }
+
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "gui",
+            "--graphics",
+            "--no-graphics",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn update_parses_graphics_transport_intent() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "update",
+            "--name",
+            "gui",
+            "--transport",
+            "local-shm",
+        ]);
+        let MachineCmd::Update(command) = cli.command else {
+            panic!("expected machine update command");
+        };
+        assert_eq!(
+            command.graphics_transport,
+            Some(GraphicsTransportIntent::LocalShm)
+        );
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "gui",
+            "--no-graphics",
+            "--transport",
+            "local-shm",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn update_parses_graphics_renderer_intent() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "update",
+            "--name",
+            "gui",
+            "--renderer",
+            "virgl",
+        ]);
+        let MachineCmd::Update(command) = cli.command else {
+            panic!("expected machine update command");
+        };
+        assert_eq!(
+            command.graphics_renderer,
+            Some(GraphicsRendererIntent::Virgl)
+        );
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "gui",
+            "--no-graphics",
+            "--renderer",
+            "venus",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2035,6 +2251,19 @@ pub struct CreateCmd {
     )]
     pub gpu_vram_mib: Option<u32>,
 
+    /// Provision display/input transport whenever this machine boots.
+    /// GPU acceleration still requires --gpu.
+    #[arg(long)]
+    pub graphics: bool,
+
+    /// Renderer policy for graphics sessions.
+    #[arg(long = "renderer", value_name = "auto|software|virgl|venus|native-context", value_parser = parse_graphics_renderer)]
+    pub graphics_renderer: Option<GraphicsRendererIntent>,
+
+    /// Presentation transport for graphics sessions.
+    #[arg(long = "transport", value_name = "rfb|local-shm", value_parser = parse_graphics_transport)]
+    pub graphics_transport: Option<GraphicsTransportIntent>,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -2178,6 +2407,20 @@ impl CreateCmd {
         }
         if self.gpu {
             params.gpu = true;
+        }
+        if self.graphics {
+            params.graphics = true;
+        }
+        if let Some(renderer) = self.graphics_renderer {
+            params.graphics = true;
+            if renderer.requests_gpu() {
+                params.gpu = true;
+            }
+            params.graphics_renderer = renderer;
+        }
+        if let Some(transport) = self.graphics_transport {
+            params.graphics = true;
+            params.graphics_transport = transport;
         }
         // CLI --gpu-vram takes precedence over Smolfile gpu_vram.
         if let Some(vram) = self.gpu_vram_mib {
@@ -2323,6 +2566,15 @@ impl CreateCmd {
             dns_filter_hosts: None,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
+            graphics: self.graphics,
+            graphics_renderer: self
+                .graphics_renderer
+                .clone()
+                .unwrap_or(GraphicsRendererIntent::Auto),
+            graphics_transport: self
+                .graphics_transport
+                .clone()
+                .unwrap_or(GraphicsTransportIntent::Rfb),
             source_smolmachine: Some(canonical_path),
         };
 
@@ -2442,6 +2694,19 @@ pub struct StartCmd {
     #[arg(long)]
     pub display: bool,
 
+    /// Start with a graphics session. GPU acceleration still requires --gpu
+    /// or an accelerated --renderer policy.
+    #[arg(long)]
+    pub graphics: bool,
+
+    /// Renderer policy for graphics sessions.
+    #[arg(long = "renderer", value_name = "auto|software|virgl|venus|native-context", value_parser = parse_graphics_renderer)]
+    pub graphics_renderer: Option<GraphicsRendererIntent>,
+
+    /// Presentation transport for graphics sessions.
+    #[arg(long = "transport", value_name = "rfb|local-shm", value_parser = parse_graphics_transport)]
+    pub graphics_transport: Option<GraphicsTransportIntent>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -2458,10 +2723,36 @@ impl StartCmd {
             // so `machine fork` can later freeze this machine as a CoW base.
             vm_common::enable_forkable_env(&name);
         }
-        let previous_display = self
-            .display
-            .then(|| std::env::var_os(smolvm::agent::display::DISPLAY_ENV));
-        if self.display {
+        let display_requested = self.display
+            || self.graphics
+            || self.graphics_renderer.is_some()
+            || self.graphics_transport.is_some();
+        let requested_renderer = self
+            .graphics_renderer
+            .clone()
+            .unwrap_or(GraphicsRendererIntent::Auto);
+        let requested_transport = self
+            .graphics_transport
+            .clone()
+            .unwrap_or(GraphicsTransportIntent::Rfb);
+        if (self.graphics || self.graphics_renderer.is_some() || self.graphics_transport.is_some())
+            && explicit_name
+        {
+            let db = smolvm::db::SmolvmDb::open()?;
+            if db.get_vm(&name)?.is_some() {
+                db.update_vm(&name, |record| {
+                    record.graphics.enabled = true;
+                    record.graphics.renderer = requested_renderer.clone();
+                    if requested_renderer.requests_gpu() {
+                        record.gpu = Some(true);
+                    }
+                    record.graphics.transport = requested_transport.clone();
+                })?;
+            }
+        }
+        let previous_display =
+            display_requested.then(|| std::env::var_os(smolvm::agent::display::DISPLAY_ENV));
+        if display_requested {
             std::env::set_var(smolvm::agent::display::DISPLAY_ENV, "1");
         }
         let result =
@@ -2470,7 +2761,16 @@ impl StartCmd {
                 Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                     // Only fall back to creating a default VM when no --name was given.
                     // With an explicit --name, VmNotFound is a real error.
-                    vm_common::start_vm_default(proxy, no_proxy, self.display)
+                    vm_common::start_vm_default(
+                        proxy,
+                        no_proxy,
+                        self.display,
+                        self.graphics
+                            || self.graphics_renderer.is_some()
+                            || self.graphics_transport.is_some(),
+                        requested_renderer,
+                        requested_transport,
+                    )
                 }
                 Err(e) => Err(e),
             };
@@ -2481,6 +2781,136 @@ impl StartCmd {
             }
         }
         result
+    }
+}
+
+/// Inspect non-secret graphics/display state.
+#[derive(Subcommand, Debug)]
+pub enum GraphicsCmd {
+    /// Read a machine's non-secret graphics status
+    Status(GraphicsStatusCmd),
+}
+
+impl GraphicsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        match self {
+            GraphicsCmd::Status(cmd) => cmd.run(),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct GraphicsStatusCmd {
+    /// Machine name.
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: String,
+
+    /// Print the non-secret graphics status as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl GraphicsStatusCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db
+            .get_vm(&self.name)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
+        let actual_state = smolvm::agent::state_probe::resolve_state(&self.name, &record);
+        let display_ready = actual_state == smolvm::config::RecordState::Running
+            && smolvm::agent::display::endpoint_is_ready(&self.name);
+        let status = smolvm::agent::graphics::GraphicsStatus::from_record(
+            &self.name,
+            &record,
+            actual_state.clone(),
+            display_ready,
+        )
+        .with_guest_probe(
+            vm_common::graphics_probe_for_running_machine(&self.name, &actual_state).as_ref(),
+        );
+
+        if self.json {
+            let output = serde_json::to_string(&status).map_err(|error| {
+                smolvm::Error::agent("encode graphics status", error.to_string())
+            })?;
+            println!("{output}");
+        } else {
+            println!("Graphics status for '{}':", status.machine);
+            println!("  state: {}", status.state);
+            println!("  session_state: {:?}", status.session_state);
+            println!("  display_requested: {}", status.display_requested);
+            println!("  display_ready: {}", status.display_ready);
+            println!(
+                "  client_attach_supported: {}",
+                status.client_attach_supported
+            );
+            println!("  hot_attach_supported: {}", status.hot_attach_supported);
+            println!(
+                "  restart_required_for_display: {}",
+                status.restart_required_for_display
+            );
+            println!("  gpu_requested: {}", status.gpu_requested);
+            println!("  gpu_ready: {}", bool_or_unknown(status.gpu_ready));
+            println!("  renderer_requested: {}", status.renderer_requested);
+            println!("  renderer: {:?}", status.renderer);
+            println!(
+                "  renderer_detail: {}",
+                status.renderer_detail.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "  renderer_qualification: {:?}",
+                status.renderer_qualification
+            );
+            println!(
+                "  renderer_qualification_detail: {}",
+                status
+                    .renderer_qualification_detail
+                    .as_deref()
+                    .unwrap_or("unknown")
+            );
+            println!("  api_requested: {:?}", status.api_requested);
+            println!("  api: {:?}", status.api);
+            println!(
+                "  api_detail: {}",
+                status.api_detail.as_deref().unwrap_or("unknown")
+            );
+            println!(
+                "  guest_dri_ready: {}",
+                bool_or_unknown(status.guest_dri_ready)
+            );
+            println!("  input_ready: {}", bool_or_unknown(status.input_ready));
+            println!(
+                "  relative_pointer_supported: {}",
+                status.relative_pointer_supported
+            );
+            println!(
+                "  pointer_capture_supported: {}",
+                status.pointer_capture_supported
+            );
+            println!("  gamepad_supported: {}", status.gamepad_supported);
+            println!("  gamepad_ready: {}", bool_or_unknown(status.gamepad_ready));
+            println!("  audio_supported: {}", status.audio_supported);
+            println!("  audio_ready: {}", bool_or_unknown(status.audio_ready));
+            println!("  seat_ready: {}", bool_or_unknown(status.seat_ready));
+            println!(
+                "  compositor_ready: {}",
+                bool_or_unknown(status.compositor_ready)
+            );
+            println!("  transport: {:?}", status.transport);
+            println!(
+                "  transport_ready: {}",
+                bool_or_unknown(status.transport_ready)
+            );
+        }
+        Ok(())
+    }
+}
+
+fn bool_or_unknown(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
     }
 }
 
@@ -2498,17 +2928,17 @@ pub struct DisplayCmd {
 
 impl DisplayCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        if self.json {
+            let output = smolvm::agent::display::read_endpoint_json(&self.name)
+                .map_err(|error| smolvm::Error::agent("read display endpoint", error))?;
+            println!("{}", String::from_utf8_lossy(&output));
+            return Ok(());
+        }
+
         let endpoint = smolvm::agent::display::read_endpoint(&self.name)
             .map_err(|error| smolvm::Error::agent("read display endpoint", error))?;
-        if self.json {
-            let output = serde_json::to_string(&endpoint).map_err(|error| {
-                smolvm::Error::agent("encode display endpoint", error.to_string())
-            })?;
-            println!("{output}");
-        } else {
-            println!("Display ready on {}:{}", endpoint.host, endpoint.port);
-            println!("Use --json to retrieve credentials for a local display client.");
-        }
+        println!("Display ready on {}:{}", endpoint.host, endpoint.port);
+        println!("Use --json to retrieve credentials for a local display client.");
         Ok(())
     }
 }
@@ -2792,6 +3222,32 @@ pub struct UpdateCmd {
     #[arg(long, conflicts_with = "gpu")]
     pub no_gpu: bool,
 
+    /// Provision display/input transport whenever this machine boots.
+    #[arg(long)]
+    pub graphics: bool,
+
+    /// Disable persisted graphics display/input transport.
+    #[arg(long, conflicts_with = "graphics")]
+    pub no_graphics: bool,
+
+    /// Presentation transport for graphics sessions.
+    #[arg(
+        long = "transport",
+        value_name = "rfb|local-shm",
+        value_parser = parse_graphics_transport,
+        conflicts_with = "no_graphics"
+    )]
+    pub graphics_transport: Option<GraphicsTransportIntent>,
+
+    /// Renderer policy for graphics sessions.
+    #[arg(
+        long = "renderer",
+        value_name = "auto|software|virgl|venus|native-context",
+        value_parser = parse_graphics_renderer,
+        conflicts_with = "no_graphics"
+    )]
+    pub graphics_renderer: Option<GraphicsRendererIntent>,
+
     /// Storage disk size in GiB (expand only)
     #[arg(long, value_name = "GiB")]
     pub storage: Option<u64>,
@@ -3006,6 +3462,29 @@ impl UpdateCmd {
             if self.no_gpu {
                 changes.push("  gpu: disabled".to_string());
                 r.gpu = Some(false);
+            }
+
+            // Graphics display session intent
+            if self.graphics {
+                changes.push("  graphics: enabled".to_string());
+                r.graphics.enabled = true;
+            }
+            if let Some(transport) = &self.graphics_transport {
+                changes.push(format!("  graphics transport: {}", transport));
+                r.graphics.enabled = true;
+                r.graphics.transport = transport.clone();
+            }
+            if let Some(renderer) = &self.graphics_renderer {
+                changes.push(format!("  graphics renderer: {}", renderer));
+                r.graphics.enabled = true;
+                r.graphics.renderer = renderer.clone();
+                if renderer.requests_gpu() {
+                    r.gpu = Some(true);
+                }
+            }
+            if self.no_graphics {
+                changes.push("  graphics: disabled".to_string());
+                r.graphics.enabled = false;
             }
         })?;
 

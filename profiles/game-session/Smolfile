@@ -1,0 +1,80 @@
+# Game-oriented Wayland profile for GPU/display/input qualification.
+#
+# Create:
+#   smolvm machine create --name game-session \
+#     --graphics --renderer auto --transport local-shm \
+#     -s profiles/game-session/Smolfile
+#
+# Start:
+#   smolvm machine start --name game-session
+#
+# RFB fallback:
+#   smolvm machine update --name game-session --transport rfb
+#   smolvm machine start --name game-session
+
+image = "debian:bookworm-slim"
+entrypoint = ["/bin/sh", "-lc"]
+cmd = ["""
+set -eu
+rm -rf /tmp/game-runtime /tmp/weston-runtime
+install -d -m 700 /tmp/game-runtime /tmp/weston-runtime
+install -d -m 1777 /tmp/.X11-unix
+if test -z "${VK_ICD_FILENAMES:-}" && test -z "${VK_DRIVER_FILES:-}"; then
+  arch="$(uname -m)"
+  if test "$arch" = "arm64"; then
+    arch="aarch64"
+  fi
+  for icd in \
+    "/usr/share/vulkan/icd.d/virtio_icd.$arch.json" \
+    /usr/share/vulkan/icd.d/virtio_icd.aarch64.json \
+    /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do
+    if test -r "$icd"; then
+      export VK_ICD_FILENAMES="$icd"
+      break
+    fi
+  done
+fi
+export XDG_RUNTIME_DIR=/tmp/game-runtime
+export LIBSEAT_BACKEND=seatd
+export SEATD_SOCK=/run/seatd.sock
+if command -v gamescope >/dev/null 2>&1; then
+  exec dbus-run-session -- gamescope -W 1280 -H 720 -- /bin/sh -lc 'while :; do sleep 3600; done'
+fi
+export XDG_RUNTIME_DIR=/tmp/weston-runtime
+exec dbus-run-session -- weston \
+  --backend=drm-backend.so \
+  --tty=1 \
+  --current-mode \
+  --idle-time=0 \
+  --xwayland \
+  --log=/var/log/weston-game-session.log
+"""]
+env = [
+    "XDG_RUNTIME_DIR=/tmp/game-runtime",
+    "LIBSEAT_BACKEND=seatd",
+    "SEATD_SOCK=/run/seatd.sock",
+]
+
+cpus = 4
+memory = 4096
+storage = 24
+overlay = 6
+net = true
+gpu = true
+gpu_vram = 4096
+
+[dev]
+init = [
+    "command -v vulkaninfo >/dev/null 2>&1 && command -v evtest >/dev/null 2>&1 && { command -v gamescope >/dev/null 2>&1 || command -v weston >/dev/null 2>&1; } || { mkdir -p /var/lib/apt/lists/partial; apt-get update; base='weston xwayland dbus-x11 fonts-dejavu-core adwaita-icon-theme udev mesa-utils mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools libinput-tools evtest joystick'; if apt-cache show gamescope >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $base gamescope; else DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $base; fi; }",
+]
+
+[health]
+exec = [
+    "sh",
+    "-lc",
+    "if test -z \"${VK_ICD_FILENAMES:-}\" && test -z \"${VK_DRIVER_FILES:-}\"; then arch=\"$(uname -m)\"; if test \"$arch\" = arm64; then arch=aarch64; fi; for icd in \"/usr/share/vulkan/icd.d/virtio_icd.$arch.json\" /usr/share/vulkan/icd.d/virtio_icd.aarch64.json /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do if test -r \"$icd\"; then export VK_ICD_FILENAMES=\"$icd\"; break; fi; done; fi; test -e /dev/dri/card0 -o -e /dev/dri/renderD128 && test -d /dev/input && find /dev/input -name 'event*' | grep -q . && test -S /run/seatd.sock && grep -q '^B: REL=' /proc/bus/input/devices && { test -S /tmp/game-runtime/wayland-0 -o -S /tmp/weston-runtime/wayland-0 -o -S /run/user/0/wayland-0 -o -S /run/wayland-0; } && { pgrep -x gamescope >/dev/null 2>&1 || pgrep -x weston >/dev/null 2>&1; } && command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/tmp/smolvm-game-vulkaninfo.summary 2>&1",
+]
+interval = "10s"
+timeout = "5s"
+retries = 24
+startup_grace = "30s"

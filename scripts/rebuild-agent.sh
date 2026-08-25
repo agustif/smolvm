@@ -10,6 +10,7 @@ set -ex
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+WORKSPACE_DIR="$(dirname "$PROJECT_DIR")"
 ROOTFS_DIR="$HOME/Library/Application Support/smolvm/agent-rootfs"
 
 cd "$PROJECT_DIR"
@@ -37,8 +38,15 @@ elif [ ! -f "$SMOLVM_BIN" ]; then
     exit 1
 fi
 
-"$SMOLVM_BIN" machine run --net --mem 2048 -v "$PROJECT_DIR:/work" --image rust:alpine \
-    -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --profile release-small -p smolvm-agent"
+BUILD_MOUNT="$PROJECT_DIR"
+BUILD_DIR_IN_VM="/work"
+if [[ -f "$WORKSPACE_DIR/rustvncserver/Cargo.toml" ]]; then
+    BUILD_MOUNT="$WORKSPACE_DIR"
+    BUILD_DIR_IN_VM="/work/smolvm"
+fi
+
+"$SMOLVM_BIN" machine run --net --mem 2048 -v "$BUILD_MOUNT:/work" --image rust:alpine \
+    -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd \"$BUILD_DIR_IN_VM\" && ${CLEAN_CMD}cargo build --profile release-small -p smolvm-agent"
 
 # Check if rootfs directory exists
 if [[ ! -d "$ROOTFS_DIR/usr/local/bin" ]]; then

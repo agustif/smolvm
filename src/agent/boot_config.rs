@@ -8,6 +8,7 @@
 //!
 //! This module defines the serializable config passed to that subprocess.
 
+use crate::config::GraphicsTransportIntent;
 use crate::data::disk::DiskFormat;
 use crate::data::network::PortMapping;
 use crate::data::resources::VmResources;
@@ -60,4 +61,44 @@ pub struct BootConfig {
     /// Optional mode-0600 rendezvous socket for a native display launch.
     #[serde(default)]
     pub display_socket: Option<PathBuf>,
+    /// Display transport requested for this native display launch.
+    #[serde(default)]
+    pub display_transport: GraphicsTransportIntent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::resources::VmResources;
+
+    #[test]
+    fn missing_display_transport_defaults_to_rfb_for_existing_boot_configs() {
+        let config = BootConfig {
+            rootfs_path: "/tmp/rootfs".into(),
+            storage_disk_path: "/tmp/storage.raw".into(),
+            overlay_disk_path: "/tmp/overlay.raw".into(),
+            vsock_socket: "/tmp/vsock.sock".into(),
+            console_log: None,
+            startup_error_log: "/tmp/startup.log".into(),
+            storage_size_gb: 10,
+            overlay_size_gb: 10,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            ssh_agent_socket: None,
+            dns_filter_hosts: None,
+            packed_layers_dir: None,
+            extra_disks: Vec::new(),
+            display_socket: Some("/tmp/display.sock".into()),
+            display_transport: GraphicsTransportIntent::LocalShm,
+        };
+        let mut value = serde_json::to_value(config).expect("boot config json");
+        value
+            .as_object_mut()
+            .expect("boot config object")
+            .remove("display_transport");
+
+        let decoded: BootConfig = serde_json::from_value(value).expect("legacy boot config");
+        assert_eq!(decoded.display_transport, GraphicsTransportIntent::Rfb);
+    }
 }

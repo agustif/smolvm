@@ -50,6 +50,117 @@ impl std::fmt::Display for RecordState {
     }
 }
 
+/// Persisted graphics display session configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GraphicsConfig {
+    /// Boot the VM with display/input transport provisioned.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Requested renderer policy. This is intent only until guest probing proves
+    /// the active renderer.
+    #[serde(default)]
+    pub renderer: GraphicsRendererIntent,
+    /// Presentation transport for local clients.
+    #[serde(default)]
+    pub transport: GraphicsTransportIntent,
+}
+
+/// Renderer policy requested by a graphics session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphicsRendererIntent {
+    /// Use the best renderer available for this machine configuration.
+    #[default]
+    Auto,
+    /// Request software rendering.
+    Software,
+    /// Request the VirGL/OpenGL path.
+    Virgl,
+    /// Request the virtio-gpu/Venus Vulkan path.
+    Venus,
+    /// Request a native-context renderer path.
+    NativeContext,
+}
+
+impl GraphicsRendererIntent {
+    /// Whether this renderer intent requests host/guest GPU acceleration.
+    pub const fn requests_gpu(&self) -> bool {
+        match self {
+            GraphicsRendererIntent::Auto | GraphicsRendererIntent::Software => false,
+            GraphicsRendererIntent::Virgl
+            | GraphicsRendererIntent::Venus
+            | GraphicsRendererIntent::NativeContext => true,
+        }
+    }
+}
+
+impl std::fmt::Display for GraphicsRendererIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphicsRendererIntent::Auto => write!(f, "auto"),
+            GraphicsRendererIntent::Software => write!(f, "software"),
+            GraphicsRendererIntent::Virgl => write!(f, "virgl"),
+            GraphicsRendererIntent::Venus => write!(f, "venus"),
+            GraphicsRendererIntent::NativeContext => write!(f, "native-context"),
+        }
+    }
+}
+
+impl std::str::FromStr for GraphicsRendererIntent {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(GraphicsRendererIntent::Auto),
+            "software" | "soft" => Ok(GraphicsRendererIntent::Software),
+            "virgl" | "opengl" | "gl" => Ok(GraphicsRendererIntent::Virgl),
+            "venus" | "vulkan" => Ok(GraphicsRendererIntent::Venus),
+            "native-context" | "native_context" => Ok(GraphicsRendererIntent::NativeContext),
+            _ => Err(format!(
+                "invalid graphics renderer '{}'; expected auto, software, virgl, venus, or native-context",
+                value
+            )),
+        }
+    }
+}
+
+/// Presentation transport requested by a graphics session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphicsTransportIntent {
+    /// RFB/VNC loopback transport.
+    #[serde(rename = "rfb")]
+    #[default]
+    Rfb,
+    /// Same-user local shared-memory transport.
+    #[serde(rename = "local-shm")]
+    LocalShm,
+}
+
+impl std::fmt::Display for GraphicsTransportIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GraphicsTransportIntent::Rfb => write!(f, "rfb"),
+            GraphicsTransportIntent::LocalShm => write!(f, "local-shm"),
+        }
+    }
+}
+
+impl std::str::FromStr for GraphicsTransportIntent {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "rfb" | "vnc" => Ok(GraphicsTransportIntent::Rfb),
+            "local-shm" | "local_shm" => Ok(GraphicsTransportIntent::LocalShm),
+            _ => Err(format!(
+                "invalid graphics transport '{}'; expected rfb or local-shm",
+                value
+            )),
+        }
+    }
+}
+
 /// Restart policy for a machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -375,6 +486,12 @@ pub struct VmRecord {
     #[serde(default)]
     pub gpu_vram_mib: Option<u32>,
 
+    /// Graphics display session intent. This is separate from GPU acceleration:
+    /// a graphics session provisions display/input transport, while `gpu`
+    /// controls accelerated virtio-gpu/Vulkan.
+    #[serde(default)]
+    pub graphics: GraphicsConfig,
+
     /// Restart configuration.
     #[serde(default)]
     pub restart: RestartConfig,
@@ -538,6 +655,7 @@ impl VmRecord {
             network,
             gpu: None,
             gpu_vram_mib: None,
+            graphics: GraphicsConfig::default(),
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
@@ -589,6 +707,7 @@ impl VmRecord {
             network,
             gpu: None,
             gpu_vram_mib: None,
+            graphics: GraphicsConfig::default(),
             restart,
             last_exit_code: None,
             init: Vec::new(),
@@ -1035,6 +1154,70 @@ mod tests {
         let default_record = VmRecord::new("default".to_string(), 1, 512, vec![], vec![], false);
         assert_eq!(default_record.gpu, None);
         assert!(!default_record.vm_resources().gpu);
+    }
+
+    #[test]
+    fn vm_record_graphics_config_is_backward_compatible_and_persistent() {
+        let legacy_json = r#"{
+            "name": "legacy",
+            "created_at": 1,
+            "state": "created",
+            "cpus": 1,
+            "mem": 512,
+            "mounts": [],
+            "ports": [],
+            "network": false
+        }"#;
+        let legacy: VmRecord = serde_json::from_str(legacy_json).unwrap();
+        assert!(!legacy.graphics.enabled);
+        assert_eq!(legacy.graphics.renderer, GraphicsRendererIntent::Auto);
+        assert_eq!(legacy.graphics.transport, GraphicsTransportIntent::Rfb);
+
+        let mut record = VmRecord::new("gui".to_string(), 2, 1024, vec![], vec![], false);
+        record.graphics.enabled = true;
+        record.graphics.renderer = GraphicsRendererIntent::NativeContext;
+        record.graphics.transport = GraphicsTransportIntent::LocalShm;
+        let json_text = serde_json::to_string(&record).unwrap();
+        assert!(json_text.contains("\"native-context\""));
+        assert!(json_text.contains("\"local-shm\""));
+        let json = json_text.into_bytes();
+        let back: VmRecord = serde_json::from_slice(&json).unwrap();
+        assert!(back.graphics.enabled);
+        assert_eq!(
+            back.graphics.renderer,
+            GraphicsRendererIntent::NativeContext
+        );
+        assert_eq!(back.graphics.transport, GraphicsTransportIntent::LocalShm);
+    }
+
+    #[test]
+    fn graphics_renderer_intent_parses_and_displays_cli_spellings() {
+        assert_eq!(
+            "auto".parse::<GraphicsRendererIntent>().unwrap(),
+            GraphicsRendererIntent::Auto
+        );
+        assert_eq!(
+            "software".parse::<GraphicsRendererIntent>().unwrap(),
+            GraphicsRendererIntent::Software
+        );
+        assert_eq!(
+            "virgl".parse::<GraphicsRendererIntent>().unwrap(),
+            GraphicsRendererIntent::Virgl
+        );
+        assert_eq!(
+            "venus".parse::<GraphicsRendererIntent>().unwrap(),
+            GraphicsRendererIntent::Venus
+        );
+        assert_eq!(
+            "native-context".parse::<GraphicsRendererIntent>().unwrap(),
+            GraphicsRendererIntent::NativeContext
+        );
+        assert_eq!(
+            GraphicsRendererIntent::NativeContext.to_string(),
+            "native-context"
+        );
+        assert!(GraphicsRendererIntent::Venus.requests_gpu());
+        assert!(!GraphicsRendererIntent::Software.requests_gpu());
     }
 
     #[test]

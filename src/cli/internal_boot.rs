@@ -377,6 +377,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .is_some_and(|hosts| !hosts.is_empty()),
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
         display_socket: config.display_socket.as_deref(),
+        display_transport: config.display_transport,
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

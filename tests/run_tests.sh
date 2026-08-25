@@ -30,12 +30,15 @@
 #   pack            test_pack.sh
 #   pack-quick      test_pack.sh --quick
 #   gpu             test_gpu.sh  (requires GPU hardware)
+#   display         test_native_display.sh (requires SMOLVM_RUN_NATIVE_DISPLAY_ACCEPTANCE=1)
 #
 # Non-pass/fail:
 #   bench           bench_vm_startup.sh (prints timing, always exits 0)
 #
 # Environment:
 #   SMOLVM_SKIP_SLOW=1   Skip long-running tests (>=25 s intentional sleeps)
+#   SMOLVM_RUN_NATIVE_DISPLAY_ACCEPTANCE=1
+#                         Enable the opt-in native display acceptance suite
 #
 # Parallelism (no-args mode only):
 #   resources runs in the background (pure CLI, no VMs -- always safe).
@@ -69,6 +72,7 @@ get_suite() {
         pack)        echo "$SCRIPT_DIR/test_pack.sh" ;;
         pack-quick)  echo "$SCRIPT_DIR/test_pack.sh --quick" ;;
         gpu)         echo "$SCRIPT_DIR/test_gpu.sh" ;;
+        display)     echo "$SCRIPT_DIR/test_native_display.sh" ;;
         scale)       echo "$SCRIPT_DIR/test_scale.sh" ;;
         *)           return 1 ;;
     esac
@@ -153,7 +157,7 @@ else
         get_suite "$group" > /dev/null || {
             echo "Unknown group: $group"
             echo "Feature suites: bare db network volumes ports storage resources reliability run image local-image packed"
-            echo "Extended suites: cli api virtio-net smolfile pack pack-quick gpu scale"
+            echo "Extended suites: cli api virtio-net smolfile pack pack-quick gpu display scale"
             echo "Other: bench"
             exit 1
         }

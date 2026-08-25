@@ -167,6 +167,8 @@ pub struct LaunchFeatures {
     pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
     /// Expose a native scanout and input bridge for this VM launch.
     pub display: bool,
+    /// Presentation transport requested for the display bridge.
+    pub display_transport: crate::config::GraphicsTransportIntent,
 }
 
 impl LaunchFeatures {
@@ -281,6 +283,8 @@ pub struct LaunchConfig<'a> {
     pub egress_telemetry: Option<&'a Path>,
     /// Mode-0600 Unix rendezvous socket used to obtain the loopback display endpoint.
     pub display_socket: Option<&'a Path>,
+    /// Presentation transport requested for the display bridge.
+    pub display_transport: crate::config::GraphicsTransportIntent,
 }
 
 /// Launch the agent VM using libkrun.
@@ -317,6 +321,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts,
         egress_telemetry,
         display_socket,
+        display_transport,
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
@@ -458,8 +463,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             let add_input_device =
                 required_display_symbol!(krun.add_input_device, "krun_add_input_device");
 
-            let bridge = super::display::DisplayBridge::start(endpoint_socket)
-                .map_err(|error| Error::agent("start display bridge", error))?;
+            let session =
+                super::graphics::GraphicsSession::start(display_transport.clone(), endpoint_socket)
+                    .map_err(|error| Error::agent("start graphics session", error))?;
             let display_id = add_display(
                 ctx,
                 super::display::DISPLAY_WIDTH,
@@ -473,7 +479,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             }
 
-            let display_backend = bridge.display_backend();
+            let display_backend = session.display_backend();
             let result = set_display_backend(
                 ctx,
                 std::ptr::from_ref(&display_backend).cast::<c_void>(),
@@ -488,8 +494,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
 
             for (config_backend, events_backend) in [
-                (bridge.keyboard_config(), bridge.keyboard_events()),
-                (bridge.pointer_config(), bridge.pointer_events()),
+                (session.keyboard_config(), session.keyboard_events()),
+                (session.pointer_config(), session.pointer_events()),
             ] {
                 let result = add_input_device(
                     ctx,
@@ -506,8 +512,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     ));
                 }
             }
-            tracing::info!(display_id, "native display and input enabled");
-            Some(bridge)
+            tracing::info!(
+                display_id,
+                transport = ?session.transport_kind(),
+                "native display and input enabled"
+            );
+            Some(session)
         } else {
             None
         };

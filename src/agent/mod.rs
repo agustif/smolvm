@@ -6,6 +6,7 @@
 pub mod boot_config;
 mod client;
 pub mod display;
+pub mod graphics;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
@@ -50,13 +51,65 @@ pub const AGENT_VM_NAME: &str = "smolvm-agent";
 ///             in-process Venus which fails (version stays 0).  With get_server_fd
 ///             provided in the callbacks struct, virglrenderer uses the externally
 ///             spawned virgl_render_server instead of fork/exec-ing its own process.
+///   bit 10 — VIRGLRENDERER_DRM             (both): DRM native context support,
+///             required for guests to expose render nodes for accelerated clients.
 fn gpu_virgl_flags(software_display: bool) -> u32 {
     #[cfg(target_os = "linux")]
     {
-        (1 << 0) | (1 << 3) | (1 << 6) | (1 << 9) | if software_display { 1 << 31 } else { 0 }
+        (1 << 0)
+            | (1 << 3)
+            | (1 << 6)
+            | (1 << 9)
+            | (1 << 10)
+            | if software_display { 1 << 31 } else { 0 }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        (1 << 6) | (1 << 7) | if software_display { 1 << 31 } else { 0 }
+        (1 << 6) | (1 << 7) | (1 << 10) | if software_display { 1 << 31 } else { 0 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gpu_virgl_flags;
+
+    #[cfg(target_os = "linux")]
+    const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
+    #[cfg(target_os = "linux")]
+    const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
+    const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+    const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
+    #[cfg(target_os = "linux")]
+    const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+    const VIRGLRENDERER_DRM: u32 = 1 << 10;
+    const KRUN_DISPLAY_SOFTWARE_ONLY: u32 = 1 << 31;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn gpu_flags_enable_linux_venus_render_server_and_drm() {
+        let flags = gpu_virgl_flags(false);
+        assert_ne!(flags & VIRGLRENDERER_USE_EGL, 0);
+        assert_ne!(flags & VIRGLRENDERER_USE_SURFACELESS, 0);
+        assert_ne!(flags & VIRGLRENDERER_VENUS, 0);
+        assert_ne!(flags & VIRGLRENDERER_RENDER_SERVER, 0);
+        assert_ne!(flags & VIRGLRENDERER_DRM, 0);
+        assert_eq!(flags & KRUN_DISPLAY_SOFTWARE_ONLY, 0);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn gpu_flags_enable_macos_venus_no_virgl_and_drm() {
+        let flags = gpu_virgl_flags(false);
+        assert_ne!(flags & VIRGLRENDERER_VENUS, 0);
+        assert_ne!(flags & VIRGLRENDERER_NO_VIRGL, 0);
+        assert_ne!(flags & VIRGLRENDERER_DRM, 0);
+        assert_eq!(flags & KRUN_DISPLAY_SOFTWARE_ONLY, 0);
+    }
+
+    #[test]
+    fn gpu_flags_include_software_display_marker_when_requested() {
+        let flags = gpu_virgl_flags(true);
+        assert_ne!(flags & KRUN_DISPLAY_SOFTWARE_ONLY, 0);
+        assert_ne!(flags & VIRGLRENDERER_DRM, 0);
     }
 }

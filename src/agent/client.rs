@@ -8,9 +8,9 @@ use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
-    encode_message, AgentRequest, AgentResponse, Envelope, ImageInfo, OverlayInfo, StorageStatus,
-    FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION,
+    encode_message, AgentRequest, AgentResponse, Envelope, GraphicsProbeStatus, ImageInfo,
+    OverlayInfo, StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE,
+    FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -831,6 +831,17 @@ impl AgentClient {
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
         expect_data(resp, "storage status")
+    }
+
+    /// Probe non-secret guest graphics readiness.
+    pub fn graphics_probe(
+        &mut self,
+        persistent_overlay_id: Option<&str>,
+    ) -> Result<GraphicsProbeStatus> {
+        let resp = self.request(&AgentRequest::GraphicsProbe {
+            persistent_overlay_id: persistent_overlay_id.map(str::to_string),
+        })?;
+        expect_data(resp, "graphics probe")
     }
 
     /// Test network connectivity directly from the agent (not via chroot).

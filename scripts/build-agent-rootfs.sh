@@ -262,7 +262,11 @@ else
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
         if command -v smolvm &> /dev/null; then
             echo "Building via smolvm (rust:alpine)..."
-            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
+            SMOLVM_BUILD_VOLUMES=(-v "$PROJECT_ROOT:/work")
+            if [[ -f "$PROJECT_ROOT/../rustvncserver/Cargo.toml" ]]; then
+                SMOLVM_BUILD_VOLUMES+=(-v "$PROJECT_ROOT/../rustvncserver:/rustvncserver")
+            fi
+            smolvm machine run --net --mem 2048 "${SMOLVM_BUILD_VOLUMES[@]}" --image rust:alpine \
                 -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent"
             AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
         else

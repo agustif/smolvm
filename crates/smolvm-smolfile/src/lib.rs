@@ -542,6 +542,129 @@ protocol = "http"
     }
 
     #[test]
+    fn desktop_wayland_profile_parses_and_declares_graphics_health() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../..")
+            .join("profiles/desktop-wayland/Smolfile");
+        let sf = load(&path).expect("desktop-wayland profile should parse");
+
+        assert_eq!(sf.image.as_deref(), Some("debian:bookworm-slim"));
+        assert_eq!(sf.cpus, Some(2));
+        assert_eq!(sf.memory, Some(2048));
+        assert_eq!(sf.storage, Some(20));
+        assert_eq!(sf.overlay, Some(4));
+        assert_eq!(sf.net, Some(true));
+        assert_eq!(sf.gpu, Some(true));
+        assert!(sf.env.iter().any(|env| env == "LIBSEAT_BACKEND=seatd"));
+        assert!(sf
+            .cmd
+            .iter()
+            .any(|cmd| cmd.contains("weston") && cmd.contains("drm-backend.so")));
+        assert!(sf.cmd.iter().any(|cmd| cmd.contains("VK_ICD_FILENAMES")));
+        assert!(!sf.cmd.iter().any(|cmd| cmd.contains("--use-pixman")));
+
+        let init = sf.dev.expect("desktop-wayland dev profile").init.join("\n");
+        for package in [
+            "weston",
+            "xwayland",
+            "mesa-utils",
+            "mesa-vulkan-drivers",
+            "libgl1-mesa-dri",
+            "vulkan-tools",
+            "libinput-tools",
+        ] {
+            assert!(
+                init.contains(package),
+                "desktop-wayland init must install {package}"
+            );
+        }
+
+        let health = sf.health.expect("desktop-wayland health check");
+        let health_command = health.exec.join(" ");
+        for expected in [
+            "/dev/dri",
+            "/dev/input",
+            "/run/seatd.sock",
+            "wayland-0",
+            "vulkaninfo",
+        ] {
+            assert!(
+                health_command.contains(expected),
+                "desktop-wayland health check must mention {expected}"
+            );
+        }
+        assert_eq!(health.interval.as_deref(), Some("10s"));
+        assert_eq!(health.timeout.as_deref(), Some("3s"));
+        assert_eq!(health.retries, Some(18));
+        assert_eq!(health.startup_grace.as_deref(), Some("20s"));
+    }
+
+    #[test]
+    fn game_session_profile_parses_and_declares_relative_pointer_health() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest_dir
+            .join("../..")
+            .join("profiles/game-session/Smolfile");
+        let sf = load(&path).expect("game-session profile should parse");
+
+        assert_eq!(sf.image.as_deref(), Some("debian:bookworm-slim"));
+        assert_eq!(sf.cpus, Some(4));
+        assert_eq!(sf.memory, Some(4096));
+        assert_eq!(sf.storage, Some(24));
+        assert_eq!(sf.overlay, Some(6));
+        assert_eq!(sf.net, Some(true));
+        assert_eq!(sf.gpu, Some(true));
+        assert_eq!(sf.gpu_vram, Some(4096));
+        assert!(sf.env.iter().any(|env| env == "LIBSEAT_BACKEND=seatd"));
+        let command = sf.cmd.join("\n");
+        assert!(command.contains("gamescope"));
+        assert!(command.contains("weston"));
+        assert!(command.contains("VK_ICD_FILENAMES"));
+        assert!(!command.contains("--use-pixman"));
+
+        let init = sf.dev.expect("game-session dev profile").init.join("\n");
+        for package in [
+            "gamescope",
+            "weston",
+            "mesa-utils",
+            "mesa-vulkan-drivers",
+            "libgl1-mesa-dri",
+            "vulkan-tools",
+            "libinput-tools",
+            "evtest",
+            "joystick",
+        ] {
+            assert!(
+                init.contains(package),
+                "game-session init must mention {package}"
+            );
+        }
+
+        let health = sf.health.expect("game-session health check");
+        let health_command = health.exec.join(" ");
+        for expected in [
+            "/dev/dri",
+            "/dev/input",
+            "/run/seatd.sock",
+            "/proc/bus/input/devices",
+            "REL=",
+            "wayland-0",
+            "gamescope",
+            "vulkaninfo --summary",
+        ] {
+            assert!(
+                health_command.contains(expected),
+                "game-session health check must mention {expected}"
+            );
+        }
+        assert_eq!(health.interval.as_deref(), Some("10s"));
+        assert_eq!(health.timeout.as_deref(), Some("5s"));
+        assert_eq!(health.retries, Some(24));
+        assert_eq!(health.startup_grace.as_deref(), Some("30s"));
+    }
+
+    #[test]
     fn parse_rejects_unknown_fields() {
         let err = parse("bogus_field = true");
         assert!(err.is_err());

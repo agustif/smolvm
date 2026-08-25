@@ -59,6 +59,17 @@ fn has_library(name: &str) -> bool {
     pkg_config::Config::new().probe(name).is_ok()
 }
 
+#[cfg(target_os = "macos")]
+fn repo_local_libkrun_bundle() -> Option<PathBuf> {
+    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
+    let candidate = manifest_dir.join("lib");
+    if candidate.join("libkrun.dylib").exists() && candidate.join("libkrunfw.5.dylib").exists() {
+        candidate.canonicalize().ok().or(Some(candidate))
+    } else {
+        None
+    }
+}
+
 fn main() {
     // Build scripts run on the HOST: `cfg!(target_os)` here describes the
     // build machine, not the artifact. Cross-compiling smolvm from macOS to
@@ -193,7 +204,26 @@ fn link_libkrun() {
         return;
     }
 
-    // Option 4: Bundled libraries in lib/linux-{arch}/ (for distribution builds)
+    // Option 4: Repo-local bundled libraries (for source-tree development)
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(lib_dir) = repo_local_libkrun_bundle() {
+            println!(
+                "cargo:rerun-if-changed={}",
+                lib_dir.join("libkrun.dylib").display()
+            );
+            println!(
+                "cargo:rerun-if-changed={}",
+                lib_dir.join("libkrunfw.5.dylib").display()
+            );
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+            link_krun();
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+            return;
+        }
+    }
+
+    // Option 5: Bundled libraries in lib/linux-{arch}/ (for distribution builds)
     #[cfg(target_os = "linux")]
     {
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -220,7 +250,7 @@ fn link_libkrun() {
         }
     }
 
-    // Option 5: System installation via pkg-config
+    // Option 6: System installation via pkg-config
     if pkg_config::Config::new()
         .atleast_version("1.0")
         .probe("libkrun")
@@ -229,7 +259,7 @@ fn link_libkrun() {
         return;
     }
 
-    // Option 6: Common installation paths
+    // Option 7: Common installation paths
     #[cfg(target_os = "macos")]
     {
         let paths = [

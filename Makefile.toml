@@ -94,7 +94,13 @@ script = [
 if [ "$(uname -s)" = "Linux" ]; then
   cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
 else
-  docker run --rm -v "$(pwd):/work" -w /work rust:alpine sh -c 'apk add musl-dev && cargo build --profile release-small -p smolvm-agent'
+  BUILD_MOUNT="$(pwd)"
+  BUILD_DIR_IN_VM="/work"
+  if [ -f "../rustvncserver/Cargo.toml" ]; then
+    BUILD_MOUNT="$(cd .. && pwd)"
+    BUILD_DIR_IN_VM="/work/smolvm"
+  fi
+  docker run --rm -v "${BUILD_MOUNT}:/work" -w "${BUILD_DIR_IN_VM}" rust:alpine sh -c 'apk add musl-dev && cargo build --profile release-small -p smolvm-agent'
 fi
 '''
 ]

@@ -15,7 +15,7 @@ use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
-use smolvm_protocol::ImageInfo;
+use smolvm_protocol::{GraphicsProbeStatus, ImageInfo};
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -52,6 +52,22 @@ pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
     } else {
         AgentManager::new_default()
     }
+}
+
+const DEFAULT_CONTAINER_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Best-effort non-secret graphics probe for a running named machine.
+pub(crate) fn graphics_probe_for_running_machine(
+    name: &str,
+    actual_state: &RecordState,
+) -> Option<GraphicsProbeStatus> {
+    if *actual_state != RecordState::Running {
+        return None;
+    }
+    let manager = AgentManager::for_vm(name).ok()?;
+    let mut client =
+        smolvm::agent::AgentClient::connect_for_state_probe(manager.vsock_socket()).ok()?;
+    client.graphics_probe(Some(name)).ok()
 }
 
 /// Return the display label for an optional VM name.
@@ -294,7 +310,7 @@ pub(crate) fn run_init_commands(
 /// — we intentionally route them through `sh` so operators can use shell
 /// features (`&&`, `|`, env expansion) without quoting gymnastics.
 fn init_argv(cmd: &str) -> Vec<String> {
-    vec!["sh".into(), "-c".into(), cmd.to_string()]
+    vec!["/bin/sh".into(), "-c".into(), cmd.to_string()]
 }
 
 /// Resolve effective env/workdir for image-backed execution.
@@ -326,6 +342,7 @@ pub(crate) fn resolve_image_runtime_defaults(
     }
 
     resolved_env = merge_env_overrides(&resolved_env, env);
+    ensure_default_container_path(&mut resolved_env);
 
     let workdir = explicit_workdir
         .map(str::to_string)
@@ -354,6 +371,12 @@ pub(crate) fn merge_env_overrides(
 fn apply_env_override(env: &mut Vec<(String, String)>, key: String, value: String) {
     env.retain(|(existing, _)| existing != &key);
     env.push((key, value));
+}
+
+fn ensure_default_container_path(env: &mut Vec<(String, String)>) {
+    if !env.iter().any(|(key, _)| key == "PATH") {
+        env.push(("PATH".to_string(), DEFAULT_CONTAINER_PATH.to_string()));
+    }
 }
 
 /// Build the `RunConfig` an image-based init command runs under.
@@ -434,6 +457,12 @@ pub struct CreateVmParams {
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
     pub gpu_vram_mib: Option<u32>,
+    /// Boot with graphics display/input transport provisioned.
+    pub graphics: bool,
+    /// Renderer policy requested for a graphics session.
+    pub graphics_renderer: smolvm::config::GraphicsRendererIntent,
+    /// Presentation transport requested for a graphics session.
+    pub graphics_transport: smolvm::config::GraphicsTransportIntent,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
@@ -603,6 +632,12 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.gpu = if params.gpu { Some(true) } else { None };
+    record.graphics.enabled = params.graphics;
+    record.graphics.renderer = params.graphics_renderer.clone();
+    if params.graphics_renderer.requests_gpu() {
+        record.gpu = Some(true);
+    }
+    record.graphics.transport = params.graphics_transport.clone();
     // Same invariant the CLI enforces, applied again here because
     // Smolfile values arrive through `params.gpu_vram_mib` without
     // passing through the clap value_parser.
@@ -1026,6 +1061,8 @@ pub fn start_vm_named(
     // Direct DB lookup — 1 read cycle instead of loading everything
     let db = SmolvmDb::open()?;
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    let display_requested =
+        record.graphics.enabled || std::env::var_os(smolvm::agent::display::DISPLAY_ENV).is_some();
 
     // Resolve via the shared probe (PID + vsock ping). The plain
     // `actual_state()` is PID-only and would treat a zombie VMM
@@ -1034,12 +1071,10 @@ pub fn start_vm_named(
     // `exec` failed.
     match smolvm::agent::state_probe::resolve_state(name, &record) {
         RecordState::Running => {
-            if std::env::var_os(smolvm::agent::display::DISPLAY_ENV).is_some()
-                && !smolvm::agent::display::endpoint_is_ready(name)
-            {
+            if display_requested && !smolvm::agent::display::endpoint_is_ready(name) {
                 return Err(Error::agent(
                     "start machine with display",
-                    "machine is already running without a display; stop it before starting with --display",
+                    "machine is already running without a display; stop it before starting with --display or --graphics",
                 ));
             }
             let pid_suffix = format_pid_suffix(record.pid);
@@ -1132,7 +1167,8 @@ pub fn start_vm_named(
     let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
-        display: std::env::var_os(smolvm::agent::display::DISPLAY_ENV).is_some(),
+        display: display_requested,
+        display_transport: record.graphics.transport.clone(),
         ..Default::default()
     }
     .with_packed_layers(
@@ -1460,14 +1496,17 @@ pub fn start_vm_default(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
     display: bool,
+    graphics: bool,
+    renderer: smolvm::config::GraphicsRendererIntent,
+    transport: smolvm::config::GraphicsTransportIntent,
 ) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
-        if display && !smolvm::agent::display::endpoint_is_ready("default") {
+        if (display || graphics) && !smolvm::agent::display::endpoint_is_ready("default") {
             return Err(smolvm::Error::agent(
                 "start machine with display",
-                "machine is already running without a display; stop it before starting with --display",
+                "machine is already running without a display; stop it before starting with --display or --graphics",
             ));
         }
         let pid_suffix = format_pid_suffix(manager.child_pid());
@@ -1487,13 +1526,31 @@ pub fn start_vm_default(
         Vec::new(),
         smolvm::data::resources::VmResources::default(),
         smolvm::agent::LaunchFeatures {
-            display,
+            display: display || graphics,
+            display_transport: transport.clone(),
             ..Default::default()
         },
     )?;
 
     let mut config = SmolvmConfig::load()?;
     persist_named_running(&mut config, "default", manager.child_pid(), None)?;
+    if graphics {
+        config
+            .update_vm("default", |r| {
+                r.graphics.enabled = true;
+                r.graphics.renderer = renderer.clone();
+                if renderer.requests_gpu() {
+                    r.gpu = Some(true);
+                }
+                r.graphics.transport = transport.clone();
+            })
+            .ok_or_else(|| {
+                smolvm::Error::config(
+                    "persist graphics intent",
+                    "VM record for 'default' missing after insert",
+                )
+            })??;
+    }
 
     // Pull image (if persisted via `machine run -d -s`) before running
     // init, then run init through the shared runner — same fix as
@@ -1855,6 +1912,16 @@ fn machine_status_json(
     });
     let fork_base_state = probe_fork_base_state(name);
 
+    let display_ready =
+        actual_state == RecordState::Running && smolvm::agent::display::endpoint_is_ready(name);
+    let graphics = smolvm::agent::graphics::GraphicsStatus::from_record(
+        name,
+        record,
+        actual_state.clone(),
+        display_ready,
+    )
+    .with_guest_probe(graphics_probe_for_running_machine(name, &actual_state).as_ref());
+
     let mut obj = serde_json::json!({
         "name": name,
         "state": actual_state.to_string(),
@@ -1872,8 +1939,8 @@ fn machine_status_json(
         "ephemeral": record.ephemeral,
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
-        "display_ready": actual_state == RecordState::Running
-            && smolvm::agent::display::endpoint_is_ready(name),
+        "display_ready": display_ready,
+        "graphics": graphics,
         "forkable": fork_base_state.is_some(),
         "fork_base_state": fork_base_state,
         "golden": record.golden,
@@ -2345,7 +2412,7 @@ mod init_runner_tests {
         assert_eq!(
             init_argv("pacman -Sy && pacman -S git"),
             vec![
-                "sh".to_string(),
+                "/bin/sh".to_string(),
                 "-c".to_string(),
                 "pacman -Sy && pacman -S git".to_string(),
             ]
@@ -2401,7 +2468,11 @@ mod init_runner_tests {
         // Command is sh-wrapped; assert the wrapped form arrives.
         assert_eq!(
             config.command,
-            vec!["sh".to_string(), "-c".to_string(), "apt update".to_string(),]
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "apt update".to_string(),
+            ]
         );
     }
 
@@ -2474,6 +2545,7 @@ mod init_runner_tests {
             vec![
                 ("FOO".to_string(), "from-image".to_string()),
                 ("BAR".to_string(), "from-image".to_string()),
+                ("PATH".to_string(), DEFAULT_CONTAINER_PATH.to_string()),
             ]
         );
         assert_eq!(defaults.workdir.as_deref(), Some("/image-workdir"));
@@ -2494,7 +2566,10 @@ mod init_runner_tests {
         assert_eq!(config.user.as_deref(), Some("steam"));
         assert_eq!(
             config.env,
-            vec![("FOO".to_string(), "from-image".to_string())]
+            vec![
+                ("FOO".to_string(), "from-image".to_string()),
+                ("PATH".to_string(), DEFAULT_CONTAINER_PATH.to_string()),
+            ]
         );
     }
 
@@ -2519,6 +2594,7 @@ mod init_runner_tests {
                 ("FOO".to_string(), "from-image".to_string()),
                 ("BAR".to_string(), "from-cli".to_string()),
                 ("BAZ".to_string(), "from-cli".to_string()),
+                ("PATH".to_string(), DEFAULT_CONTAINER_PATH.to_string()),
             ]
         );
         assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
@@ -2544,6 +2620,7 @@ mod init_runner_tests {
             vec![
                 ("FOO".to_string(), "last-image".to_string()),
                 ("BAR".to_string(), "last-cli".to_string()),
+                ("PATH".to_string(), DEFAULT_CONTAINER_PATH.to_string()),
             ]
         );
         assert_eq!(defaults.workdir.as_deref(), Some("/image-workdir"));
@@ -2556,9 +2633,24 @@ mod init_runner_tests {
 
         let defaults = resolve_image_runtime_defaults(None, &env, Some("/explicit-workdir"));
 
-        assert_eq!(defaults.env, env);
+        assert_eq!(
+            defaults.env,
+            vec![
+                ("FOO".to_string(), "from-explicit".to_string()),
+                ("PATH".to_string(), DEFAULT_CONTAINER_PATH.to_string()),
+            ]
+        );
         assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
         assert!(defaults.user.is_none());
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_preserves_explicit_path() {
+        let env = vec![("PATH".to_string(), "/custom/bin".to_string())];
+
+        let defaults = resolve_image_runtime_defaults(None, &env, None);
+
+        assert_eq!(defaults.env, env);
     }
 
     #[test]

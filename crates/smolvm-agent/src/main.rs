@@ -11,8 +11,8 @@
 #[cfg(target_os = "linux")]
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
-    error_codes, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth, AGENT_READY_MARKER,
-    LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
+    error_codes, ports, AgentRequest, AgentResponse, Envelope, GraphicsProbeStatus, RegistryAuth,
+    AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -2036,6 +2036,7 @@ fn handle_request(
     // Ping, NetworkTest, VmExec, and Shutdown don't access /storage.
     match &request {
         AgentRequest::Ping
+        | AgentRequest::GraphicsProbe { .. }
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
         | AgentRequest::Shutdown => {}
@@ -2067,6 +2068,10 @@ fn handle_request(
         AgentRequest::FormatStorage => handle_format_storage(),
 
         AgentRequest::StorageStatus => handle_storage_status(),
+
+        AgentRequest::GraphicsProbe {
+            persistent_overlay_id,
+        } => handle_graphics_probe(persistent_overlay_id.as_deref()),
 
         AgentRequest::NetworkTest { url } => {
             info!(url = %url, "testing network connectivity directly from agent");
@@ -4830,6 +4835,507 @@ fn handle_storage_status() -> AgentResponse {
     AgentResponse::from_result(storage::status(), error_codes::STATUS_FAILED)
 }
 
+/// Handle non-secret guest graphics readiness probe.
+fn handle_graphics_probe(persistent_overlay_id: Option<&str>) -> AgentResponse {
+    let dri_nodes = path_entries_with_prefixes("/dev/dri", &["card", "renderD"]);
+    let input_nodes = path_entries_with_prefixes("/dev/input", &["event"]);
+    let seat_socket = first_existing_path(&["/run/seatd.sock"]);
+    let compositor_sockets = compositor_socket_paths(persistent_overlay_id);
+    let renderer_hint = graphics_renderer_hint(&dri_nodes);
+    let api_probe = container_graphics_api_probe(persistent_overlay_id).or_else(graphics_api_probe);
+
+    let status = GraphicsProbeStatus {
+        dri_ready: !dri_nodes.is_empty(),
+        renderer_hint,
+        api_hint: api_probe.as_ref().and_then(|probe| probe.hint.clone()),
+        api_probe_failure_detail: api_probe.and_then(|probe| probe.failure_detail),
+        dri_nodes,
+        input_ready: !input_nodes.is_empty(),
+        input_nodes,
+        seat_ready: seat_socket.is_some(),
+        seat_socket,
+        compositor_ready: !compositor_sockets.is_empty(),
+        compositor_sockets,
+    };
+
+    AgentResponse::ok_with_data(status)
+}
+
+fn graphics_renderer_hint(dri_nodes: &[String]) -> Option<String> {
+    renderer_hint_from_sysfs(dri_nodes, std::path::Path::new("/sys/class/drm"))
+        .or_else(|| (!dri_nodes.is_empty()).then(|| "drm-present".to_string()))
+}
+
+fn renderer_hint_from_sysfs(
+    dri_nodes: &[String],
+    sys_class_drm: &std::path::Path,
+) -> Option<String> {
+    for node in dri_nodes {
+        let device_dir = sys_class_drm.join(node).join("device");
+        let driver = std::fs::read_link(device_dir.join("driver"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            });
+        let vendor = read_trimmed(device_dir.join("vendor"));
+        let device = read_trimmed(device_dir.join("device"));
+        if driver.is_none() && vendor.is_none() && device.is_none() {
+            continue;
+        }
+
+        let mut parts = Vec::new();
+        parts.push(node.clone());
+        if let Some(driver) = driver {
+            parts.push(format!("driver={driver}"));
+        }
+        if let Some(vendor) = vendor {
+            parts.push(format!("vendor={vendor}"));
+        }
+        if let Some(device) = device {
+            parts.push(format!("device={device}"));
+        }
+        return Some(parts.join(" "));
+    }
+    None
+}
+
+#[derive(Debug, Clone, Default)]
+struct ApiProbe {
+    hint: Option<String>,
+    failure_detail: Option<String>,
+}
+
+fn graphics_api_probe() -> Option<ApiProbe> {
+    let vulkan = probe_api_command("vulkan", "vulkaninfo", &["--summary"]);
+    if vulkan.hint.is_some() {
+        return Some(vulkan);
+    }
+    let vulkan_failure = vulkan.failure_detail;
+    let opengl = first_successful_api_probe([
+        probe_api_command("opengl", "glxinfo", &["-B"]),
+        probe_api_command("opengl", "eglinfo", &["-B"]),
+    ]);
+    Some(ApiProbe {
+        hint: opengl.and_then(|probe| probe.hint),
+        failure_detail: vulkan_failure,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn container_graphics_api_probe(persistent_overlay_id: Option<&str>) -> Option<ApiProbe> {
+    let container_id = resolve_main_container(persistent_overlay_id)?;
+    let vulkan = probe_container_api_command(&container_id, "vulkan", "vulkaninfo", &["--summary"]);
+    if vulkan.hint.is_some() {
+        return Some(vulkan);
+    }
+    let vulkan_failure = vulkan.failure_detail;
+    let opengl = first_successful_api_probe([
+        probe_container_api_command(&container_id, "opengl", "eglinfo", &["-B"]),
+        probe_container_api_command(&container_id, "opengl", "glxinfo", &["-B"]),
+    ]);
+    Some(ApiProbe {
+        hint: opengl.and_then(|probe| probe.hint),
+        failure_detail: vulkan_failure,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn container_graphics_api_probe(_persistent_overlay_id: Option<&str>) -> Option<ApiProbe> {
+    None
+}
+
+fn probe_api_command(api: &str, program: &str, args: &[&str]) -> ApiProbe {
+    let Some(executable) = executable_in_path(program) else {
+        return ApiProbe {
+            hint: None,
+            failure_detail: Some(format!("{api}: {program}: command not found")),
+        };
+    };
+    let output = run_bounded_probe_command(&executable, args, 2_000, 8 * 1024);
+    ApiProbe {
+        hint: output
+            .as_ref()
+            .and_then(|output| output.success.then(|| output.text.as_str()))
+            .and_then(|text| api_hint_from_probe_output(api, text)),
+        failure_detail: output.and_then(|output| {
+            (!output.success).then(|| api_failure_from_probe_output(api, program, &output.text))
+        }),
+    }
+}
+
+fn first_successful_api_probe<const N: usize>(probes: [ApiProbe; N]) -> Option<ApiProbe> {
+    probes.into_iter().find(|probe| probe.hint.is_some())
+}
+
+fn preferred_virtio_vulkan_icd_path() -> Option<&'static str> {
+    let preferred = match std::env::consts::ARCH {
+        "aarch64" | "arm64" => Some("/usr/share/vulkan/icd.d/virtio_icd.aarch64.json"),
+        "x86_64" => Some("/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"),
+        _ => None,
+    };
+
+    preferred
+        .into_iter()
+        .chain([
+            "/usr/share/vulkan/icd.d/virtio_icd.aarch64.json",
+            "/usr/share/vulkan/icd.d/virtio_icd.x86_64.json",
+        ])
+        .find(|path| std::path::Path::new(path).is_file())
+}
+
+#[cfg(target_os = "linux")]
+fn probe_container_api_command(
+    container_id: &str,
+    api: &str,
+    program: &str,
+    args: &[&str],
+) -> ApiProbe {
+    let script = container_api_probe_script(program, args);
+    let Some(output) = run_bounded_container_probe_command(container_id, &script, 3_000) else {
+        return ApiProbe {
+            hint: None,
+            failure_detail: Some(format!("{api}: {program}: probe did not complete")),
+        };
+    };
+    ApiProbe {
+        hint: output
+            .success
+            .then(|| output.text.as_str())
+            .and_then(|text| api_hint_from_probe_output(api, text)),
+        failure_detail: (!output.success)
+            .then(|| api_failure_from_probe_output(api, program, &output.text)),
+    }
+}
+
+fn container_api_probe_script(program: &str, args: &[&str]) -> String {
+    let arg_string = args.join(" ");
+    let command = if arg_string.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {arg_string}")
+    };
+    format!(
+        r#"set -u
+if ! command -v {program} >/dev/null 2>&1; then
+  echo "{program}: command not found"
+  exit 127
+fi
+for runtime in /tmp/weston-runtime /tmp/game-runtime /run/user/0 /run; do
+  if test -S "$runtime/wayland-0"; then
+    export XDG_RUNTIME_DIR="$runtime"
+    export WAYLAND_DISPLAY=wayland-0
+    break
+  fi
+done
+if test -S /tmp/.X11-unix/X0; then
+  export DISPLAY=:0
+fi
+if test -z "${{VK_ICD_FILENAMES:-}}" && test -z "${{VK_DRIVER_FILES:-}}"; then
+  arch="$(uname -m)"
+  if test "$arch" = "arm64"; then
+    arch="aarch64"
+  fi
+  for icd in \
+    "/usr/share/vulkan/icd.d/virtio_icd.$arch.json" \
+    /usr/share/vulkan/icd.d/virtio_icd.aarch64.json \
+    /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do
+    if test -r "$icd"; then
+      export VK_ICD_FILENAMES="$icd"
+      break
+    fi
+  done
+fi
+tmp="/tmp/smolvm-graphics-api-probe-$$.out"
+{command} > "$tmp" 2>&1
+status=$?
+head -c 8192 "$tmp"
+rm -f "$tmp"
+exit "$status"
+"#
+    )
+}
+
+fn api_hint_from_probe_output(api: &str, output: &str) -> Option<String> {
+    let mut details = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("device")
+                || lower.contains("driver")
+                || lower.contains("renderer")
+                || lower.contains("vendor")
+                || lower.contains("vulkan")
+                || lower.contains("opengl")
+        })
+        .take(3)
+        .map(sanitize_probe_detail)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if details.is_empty() {
+        details.extend(
+            output
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .take(2)
+                .map(sanitize_probe_detail)
+                .filter(|line| !line.is_empty()),
+        );
+    }
+
+    (!details.is_empty()).then(|| format!("{api}: {}", details.join("; ")))
+}
+
+fn api_failure_from_probe_output(api: &str, program: &str, output: &str) -> String {
+    let detail = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .map(sanitize_probe_detail)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detail.is_empty() {
+        format!("{api}: {program} failed without output")
+    } else {
+        format!("{api}: {program} failed: {detail}")
+    }
+}
+
+struct ProbeCommandOutput {
+    success: bool,
+    text: String,
+}
+
+fn sanitize_probe_detail(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(240)
+        .collect::<String>()
+}
+
+fn executable_in_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+fn run_bounded_probe_command(
+    executable: &std::path::Path,
+    args: &[&str],
+    timeout_ms: u64,
+    output_limit: usize,
+) -> Option<ProbeCommandOutput> {
+    let temp_dir = std::env::temp_dir();
+    let unique = format!(
+        "smolvm-graphics-probe-{}-{}",
+        std::process::id(),
+        uptime_ms()
+    );
+    let stdout_path = temp_dir.join(format!("{unique}.out"));
+    let stderr_path = temp_dir.join(format!("{unique}.err"));
+    let stdout = std::fs::File::create(&stdout_path).ok()?;
+    let stderr = std::fs::File::create(&stderr_path).ok()?;
+
+    let mut child = match Command::new(executable)
+        .args(args)
+        .env("LC_ALL", "C")
+        .envs(
+            preferred_virtio_vulkan_icd_path()
+                .filter(|_| std::env::var_os("VK_ICD_FILENAMES").is_none())
+                .filter(|_| std::env::var_os("VK_DRIVER_FILES").is_none())
+                .map(|path| [("VK_ICD_FILENAMES", path)])
+                .into_iter()
+                .flatten(),
+        )
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            return None;
+        }
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let text = read_limited_text(&stdout_path, output_limit)
+        .or_else(|| read_limited_text(&stderr_path, output_limit))
+        .unwrap_or_default();
+    let success = status.is_some_and(|status| status.success());
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    Some(ProbeCommandOutput { success, text })
+}
+
+#[cfg(target_os = "linux")]
+fn run_bounded_container_probe_command(
+    container_id: &str,
+    script: &str,
+    timeout_ms: u64,
+) -> Option<ProbeCommandOutput> {
+    let command = vec!["sh".to_string(), "-lc".to_string(), script.to_string()];
+    let mut child = match crun::CrunCommand::exec(container_id, &[], &command, None, false)
+        .capture_output()
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return None,
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let output = child.wait_with_output().ok()?;
+    let success = status.is_some_and(|status| status.success());
+    let text = if output.stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    Some(ProbeCommandOutput { success, text })
+}
+
+fn read_trimmed(path: impl AsRef<std::path::Path>) -> Option<String> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn read_limited_text(path: &std::path::Path, limit: usize) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = file.take(limit as u64);
+    let mut output = String::new();
+    reader.read_to_string(&mut output).ok()?;
+    (!output.trim().is_empty()).then_some(output)
+}
+
+fn path_entries_with_prefixes(dir: &str, prefixes: &[&str]) -> Vec<String> {
+    let mut entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    entries.sort();
+    entries
+}
+
+fn first_existing_path(paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .copied()
+        .find(|path| std::path::Path::new(path).exists())
+        .map(str::to_string)
+}
+
+fn compositor_socket_paths(persistent_overlay_id: Option<&str>) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_prefixed_paths("/run/user/0", &["wayland-"], &mut paths);
+    collect_prefixed_paths("/run", &["wayland-"], &mut paths);
+    collect_prefixed_paths("/tmp", &["wayland-"], &mut paths);
+    collect_prefixed_paths("/tmp/weston-runtime", &["wayland-"], &mut paths);
+    collect_prefixed_paths("/tmp/game-runtime", &["wayland-"], &mut paths);
+    collect_prefixed_paths("/tmp/.X11-unix", &["X"], &mut paths);
+    paths.extend(container_compositor_socket_paths(persistent_overlay_id));
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+#[cfg(target_os = "linux")]
+fn container_compositor_socket_paths(persistent_overlay_id: Option<&str>) -> Vec<String> {
+    let Some(container_id) = resolve_main_container(persistent_overlay_id) else {
+        return Vec::new();
+    };
+    let command = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        r#"for dir in /tmp/weston-runtime /tmp/game-runtime /run/user/0 /run /tmp; do
+  for path in "$dir"/wayland-*; do
+    test -e "$path" && printf '%s\n' "$path"
+  done
+done
+for path in /tmp/.X11-unix/X*; do
+  test -e "$path" && printf '%s\n' "$path"
+done"#
+            .to_string(),
+    ];
+    let Ok(output) = crun::CrunCommand::exec(&container_id, &[], &command, None, false)
+        .capture_output()
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn container_compositor_socket_paths(_persistent_overlay_id: Option<&str>) -> Vec<String> {
+    Vec::new()
+}
+
+fn collect_prefixed_paths(dir: &str, prefixes: &[&str], paths: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            paths.push(entry.path().display().to_string());
+        }
+    }
+}
+
 // ============================================================================
 // VM-Level Exec Handlers (Direct Execution in VM)
 // ============================================================================
@@ -5451,6 +5957,94 @@ mod tests {
             input_udev_metadata(InputDeviceKind::Pointer),
             "E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_SEAT=seat0\nG:seat\nQ:seat\nV:1\n"
         );
+    }
+
+    #[test]
+    fn api_hint_parser_extracts_vulkan_summary_lines() {
+        let output = "\
+Vulkan Instance Version: 1.3.0
+GPU0:
+\tdeviceName        = Virtio-GPU Venus
+\tdriverName        = venus
+\tapiVersion        = 1.3.289
+";
+        let hint = api_hint_from_probe_output("vulkan", output).expect("vulkan hint");
+        assert!(hint.starts_with("vulkan: "));
+        assert!(hint.contains("Vulkan Instance Version"));
+        assert!(hint.contains("deviceName"));
+        assert!(hint.contains("driverName"));
+    }
+
+    #[test]
+    fn api_hint_parser_sanitizes_control_characters_and_bounds_detail() {
+        let long_renderer = format!("renderer: {}\u{0007}", "x".repeat(400));
+        let hint = api_hint_from_probe_output("opengl", &long_renderer).expect("opengl hint");
+        assert!(hint.starts_with("opengl: renderer: "));
+        assert!(!hint.contains('\u{0007}'));
+        assert!(hint.len() < 280);
+    }
+
+    #[test]
+    fn container_api_probe_script_sets_display_environment_and_bounds_output() {
+        let script = container_api_probe_script("vulkaninfo", &["--summary"]);
+        assert!(script.contains("command -v vulkaninfo"));
+        assert!(script.contains("XDG_RUNTIME_DIR"));
+        assert!(script.contains("WAYLAND_DISPLAY=wayland-0"));
+        assert!(script.contains("DISPLAY=:0"));
+        assert!(script.contains("VK_ICD_FILENAMES"));
+        assert!(script.contains("virtio_icd"));
+        assert!(script.contains("vulkaninfo --summary"));
+        assert!(script.contains("head -c 8192"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn renderer_hint_reads_drm_sysfs_driver_vendor_and_device() {
+        let root =
+            std::env::temp_dir().join(format!("smolvm-renderer-hint-test-{}", std::process::id()));
+        let drm = root.join("class/drm");
+        let device_dir = drm.join("renderD128/device");
+        let driver_dir = root.join("drivers/virtio_gpu");
+        std::fs::create_dir_all(&device_dir).expect("create fake device dir");
+        std::fs::create_dir_all(&driver_dir).expect("create fake driver dir");
+        std::fs::write(device_dir.join("vendor"), "0x1af4\n").expect("write vendor");
+        std::fs::write(device_dir.join("device"), "0x1050\n").expect("write device");
+        std::os::unix::fs::symlink(&driver_dir, device_dir.join("driver"))
+            .expect("create driver symlink");
+
+        let hint =
+            renderer_hint_from_sysfs(&["renderD128".to_string()], &drm).expect("renderer hint");
+        assert!(hint.contains("renderD128"));
+        assert!(hint.contains("driver=virtio_gpu"));
+        assert!(hint.contains("vendor=0x1af4"));
+        assert!(hint.contains("device=0x1050"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compositor_socket_probe_includes_profile_runtime_dirs() {
+        let weston_runtime = std::path::Path::new("/tmp/weston-runtime");
+        let game_runtime = std::path::Path::new("/tmp/game-runtime");
+        let weston_entry =
+            weston_runtime.join(format!("wayland-smolvm-test-{}", std::process::id()));
+        let game_entry = game_runtime.join(format!("wayland-smolvm-test-{}", std::process::id()));
+
+        std::fs::create_dir_all(weston_runtime).expect("create weston runtime dir");
+        std::fs::create_dir_all(game_runtime).expect("create game runtime dir");
+        std::fs::write(&weston_entry, "").expect("create weston probe entry");
+        std::fs::write(&game_entry, "").expect("create game probe entry");
+
+        let paths = compositor_socket_paths(None);
+        assert!(paths
+            .iter()
+            .any(|path| path == &weston_entry.display().to_string()));
+        assert!(paths
+            .iter()
+            .any(|path| path == &game_entry.display().to_string()));
+
+        let _ = std::fs::remove_file(weston_entry);
+        let _ = std::fs::remove_file(game_entry);
     }
 
     #[test]

@@ -199,6 +199,18 @@ pub enum AgentRequest {
     /// Get storage disk status.
     StorageStatus,
 
+    /// Probe non-secret guest graphics readiness.
+    ///
+    /// This reads kernel/runtime surfaces such as `/dev/dri`, `/dev/input`, and
+    /// compositor sockets. When a persistent overlay id is supplied, the agent
+    /// may also inspect the registered main workload container for compositor
+    /// readiness. It does not return endpoint credentials.
+    GraphicsProbe {
+        /// Persistent overlay id for the machine's main workload container.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persistent_overlay_id: Option<String>,
+    },
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     NetworkTest {
@@ -412,6 +424,7 @@ impl AgentRequest {
             AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
+            AgentRequest::GraphicsProbe { .. } => "GraphicsProbe".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
@@ -657,6 +670,37 @@ impl AgentResponse {
             Err(e) => Self::from_err(e, error_code),
         }
     }
+}
+
+/// Non-secret guest graphics readiness collected by the agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphicsProbeStatus {
+    /// Whether at least one DRM node was found under `/dev/dri`.
+    pub dri_ready: bool,
+    /// DRM node names found under `/dev/dri`.
+    pub dri_nodes: Vec<String>,
+    /// Whether at least one input event node was found under `/dev/input`.
+    pub input_ready: bool,
+    /// Input event node names found under `/dev/input`.
+    pub input_nodes: Vec<String>,
+    /// Whether a seat manager socket was found.
+    pub seat_ready: bool,
+    /// Seat manager socket path when detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_socket: Option<String>,
+    /// Whether a Wayland or X11 compositor/display socket was found.
+    pub compositor_ready: bool,
+    /// Compositor/display socket paths when detected.
+    pub compositor_sockets: Vec<String>,
+    /// Best-effort renderer hint derived from device presence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_hint: Option<String>,
+    /// Best-effort graphics API hint when a real API probe exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_hint: Option<String>,
+    /// Best-effort failure detail from a preferred graphics API probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_probe_failure_detail: Option<String>,
 }
 
 /// Image information returned by Query/ListImages.

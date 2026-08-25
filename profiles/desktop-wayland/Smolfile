@@ -1,11 +1,16 @@
-# Persistent Debian desktop for smolvm's native display transport.
+# Known-good Wayland desktop profile for GPU/display acceptance.
 #
-# Create once:
-#   smolvm machine create --name debian-gui \
-#     -s examples/weston-desktop/weston.smolfile
+# Create:
+#   smolvm machine create --name desktop-wayland \
+#     --graphics --renderer auto --transport rfb \
+#     -s profiles/desktop-wayland/Smolfile
 #
-# Start (including after every explicit stop):
-#   smolvm machine start --name debian-gui --display
+# Start:
+#   smolvm machine start --name desktop-wayland
+#
+# Local-shm:
+#   smolvm machine update --name desktop-wayland --transport local-shm
+#   smolvm machine start --name desktop-wayland
 
 image = "debian:bookworm-slim"
 entrypoint = ["/bin/sh", "-lc"]
@@ -54,3 +59,14 @@ gpu = true
 init = [
     "command -v weston >/dev/null 2>&1 && command -v vulkaninfo >/dev/null 2>&1 && command -v glxinfo >/dev/null 2>&1 || { mkdir -p /var/lib/apt/lists/partial; apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends weston xwayland dbus-x11 fonts-dejavu-core adwaita-icon-theme udev mesa-utils mesa-vulkan-drivers libgl1-mesa-dri vulkan-tools libinput-tools; }",
 ]
+
+[health]
+exec = [
+    "sh",
+    "-lc",
+    "if test -z \"${VK_ICD_FILENAMES:-}\" && test -z \"${VK_DRIVER_FILES:-}\"; then arch=\"$(uname -m)\"; if test \"$arch\" = arm64; then arch=aarch64; fi; for icd in \"/usr/share/vulkan/icd.d/virtio_icd.$arch.json\" /usr/share/vulkan/icd.d/virtio_icd.aarch64.json /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do if test -r \"$icd\"; then export VK_ICD_FILENAMES=\"$icd\"; break; fi; done; fi; test -e /dev/dri/card0 -o -e /dev/dri/renderD128 && test -d /dev/input && find /dev/input -name 'event*' | grep -q . && test -S /run/seatd.sock && { test -S /tmp/weston-runtime/wayland-0 -o -S /run/user/0/wayland-0 -o -S /run/wayland-0; } && { command -v vulkaninfo >/dev/null 2>&1 || command -v glxinfo >/dev/null 2>&1 || command -v eglinfo >/dev/null 2>&1; }",
+]
+interval = "10s"
+timeout = "3s"
+retries = 18
+startup_grace = "20s"
