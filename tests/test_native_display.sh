@@ -154,7 +154,13 @@ PY
 
 assert_graphics_status_ready() {
     local expected_transport="$1"
-    local deadline=$((SECONDS + 60))
+    local wait_seconds=60
+    if [[ "$DISPLAY_REQUIRE_ACCELERATED" == "1" ]]; then
+        # Fedora first boot installs COPR Mesa + Weston; display_ready is host-side
+        # and becomes true before dnf/weston finish.
+        wait_seconds="${SMOLVM_DISPLAY_ACCEPTANCE_GRAPHICS_STATUS_TIMEOUT:-420}"
+    fi
+    local deadline=$((SECONDS + wait_seconds))
     local status
     local last_error="graphics status was not checked"
     local last_status=""
@@ -520,6 +526,7 @@ def read_u64(data, offset):
 
 
 def load_non_black_frame(path, deadline):
+    # First-boot 3D guests can take a few extra seconds to publish scanout.
     last_error = None
     while time.monotonic() < deadline:
         try:
@@ -604,7 +611,7 @@ if os.path.basename(frame_ring) != "local-shm.frames":
 if os.path.dirname(control_socket) != os.path.dirname(frame_ring):
     raise RuntimeError("control socket and frame ring are not in the same runtime directory")
 
-width, height = load_non_black_frame(frame_ring, time.monotonic() + 30)
+width, height = load_non_black_frame(frame_ring, time.monotonic() + 90)
 center_x = max(0, width // 2)
 center_y = max(0, height // 2)
 messages = [

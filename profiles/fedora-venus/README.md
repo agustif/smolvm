@@ -23,3 +23,6 @@ is set.
 
 Health requires `vulkaninfo --summary` to succeed, not merely that the
 binary exists.
+
+Fedora Weston 14 does not accept Debian's `--tty=1`. The profile also exports
+a PATH that includes `/usr/sbin` because `vulkaninfo` lands there.

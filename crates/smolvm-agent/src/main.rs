@@ -5017,6 +5017,7 @@ fn container_api_probe_script(program: &str, args: &[&str]) -> String {
     };
     format!(
         r#"set -u
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${{PATH:+:$PATH}}"
 if ! command -v {program} >/dev/null 2>&1; then
   echo "{program}: command not found"
   exit 127
@@ -5121,8 +5122,17 @@ fn sanitize_probe_detail(value: &str) -> String {
 }
 
 fn executable_in_path(program: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    for extra in ["/usr/sbin", "/usr/bin", "/sbin", "/bin"] {
+        let extra = std::path::PathBuf::from(extra);
+        if !dirs.iter().any(|dir| dir == &extra) {
+            dirs.push(extra);
+        }
+    }
+    dirs.into_iter()
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
 }
@@ -5988,6 +5998,7 @@ GPU0:
     fn container_api_probe_script_sets_display_environment_and_bounds_output() {
         let script = container_api_probe_script("vulkaninfo", &["--summary"]);
         assert!(script.contains("command -v vulkaninfo"));
+        assert!(script.contains("/usr/sbin"));
         assert!(script.contains("XDG_RUNTIME_DIR"));
         assert!(script.contains("WAYLAND_DISPLAY=wayland-0"));
         assert!(script.contains("DISPLAY=:0"));

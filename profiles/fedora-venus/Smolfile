@@ -16,6 +16,7 @@ image = "fedora:42"
 entrypoint = ["/bin/sh", "-lc"]
 cmd = ["""
 set -eu
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 rm -rf /tmp/weston-runtime
 install -d -m 700 /tmp/weston-runtime
 install -d -m 1777 /tmp/.X11-unix
@@ -34,15 +35,20 @@ if test -z "${VK_ICD_FILENAMES:-}" && test -z "${VK_DRIVER_FILES:-}"; then
     fi
   done
 fi
+# Fedora Weston 14: use the drm backend name, pin wayland-0, and pixman
+# scanout so virtio-gpu can copy frames into RFB/local-shm. GL/EGL weston
+# still talks to Venus for vulkaninfo, but does not flush 2D scanout buffers.
 exec dbus-run-session -- weston \
-  --backend=drm-backend.so \
-  --tty=1 \
+  --backend=drm \
+  --renderer=pixman \
+  --socket=wayland-0 \
   --current-mode \
   --idle-time=0 \
   --xwayland \
   --log=/var/log/weston.log
 """]
 env = [
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
     "XDG_RUNTIME_DIR=/tmp/weston-runtime",
     "LIBSEAT_BACKEND=seatd",
     "SEATD_SOCK=/run/seatd.sock",
@@ -58,7 +64,8 @@ gpu_vram = 4096
 
 [dev]
 init = [
-    """command -v weston >/dev/null 2>&1 && command -v vulkaninfo >/dev/null 2>&1 && test -r /usr/share/vulkan/icd.d/virtio_icd.$(uname -m | sed 's/arm64/aarch64/').json -o -r /usr/share/vulkan/icd.d/virtio_icd.aarch64.json -o -r /usr/share/vulkan/icd.d/virtio_icd.x86_64.json || {
+    """export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+command -v weston >/dev/null 2>&1 && command -v vulkaninfo >/dev/null 2>&1 && test -r /usr/share/vulkan/icd.d/virtio_icd.$(uname -m | sed 's/arm64/aarch64/').json -o -r /usr/share/vulkan/icd.d/virtio_icd.aarch64.json -o -r /usr/share/vulkan/icd.d/virtio_icd.x86_64.json || {
   set -eu
   arch="$(uname -m)"
   dnf -y install dnf-plugins-core
@@ -68,14 +75,22 @@ init = [
   dnf install -y --allowerasing \
     weston xorg-x11-server-Xwayland dbus-daemon dejavu-sans-fonts \
     adwaita-icon-theme mesa-dri-drivers mesa-vulkan-drivers vulkan-tools libinput
-}""",
+}
+# Probe scripts may run with a PATH that omits sbin.
+if test -x /usr/sbin/vulkaninfo && test ! -x /usr/bin/vulkaninfo; then
+  ln -sf /usr/sbin/vulkaninfo /usr/bin/vulkaninfo
+fi
+if test -x /usr/sbin/weston && test ! -x /usr/bin/weston; then
+  ln -sf /usr/sbin/weston /usr/bin/weston
+fi
+""",
 ]
 
 [health]
 exec = [
     "sh",
     "-lc",
-    "if test -z \"${VK_ICD_FILENAMES:-}\" && test -z \"${VK_DRIVER_FILES:-}\"; then arch=\"$(uname -m)\"; if test \"$arch\" = arm64; then arch=aarch64; fi; for icd in \"/usr/share/vulkan/icd.d/virtio_icd.$arch.json\" /usr/share/vulkan/icd.d/virtio_icd.aarch64.json /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do if test -r \"$icd\"; then export VK_ICD_FILENAMES=\"$icd\"; break; fi; done; fi; test -e /dev/dri/card0 -o -e /dev/dri/renderD128 && test -d /dev/input && find /dev/input -name 'event*' | grep -q . && test -S /run/seatd.sock && { test -S /tmp/weston-runtime/wayland-0 -o -S /run/user/0/wayland-0 -o -S /run/wayland-0; } && command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/tmp/smolvm-vulkaninfo.summary 2>&1",
+    "export PATH=\"/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}\"; if test -z \"${VK_ICD_FILENAMES:-}\" && test -z \"${VK_DRIVER_FILES:-}\"; then arch=\"$(uname -m)\"; if test \"$arch\" = arm64; then arch=aarch64; fi; for icd in \"/usr/share/vulkan/icd.d/virtio_icd.$arch.json\" /usr/share/vulkan/icd.d/virtio_icd.aarch64.json /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do if test -r \"$icd\"; then export VK_ICD_FILENAMES=\"$icd\"; break; fi; done; fi; test -e /dev/dri/card0 -o -e /dev/dri/renderD128 && test -d /dev/input && find /dev/input -name 'event*' | grep -q . && test -S /run/seatd.sock && { test -S /tmp/weston-runtime/wayland-0 -o -S /run/user/0/wayland-0 -o -S /run/wayland-0; } && command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/tmp/smolvm-vulkaninfo.summary 2>&1",
 ]
 interval = "10s"
 timeout = "8s"

@@ -11,6 +11,7 @@ smolvm_bin="${2:-${SMOLVM_BIN:-smolvm}}"
 
 "$smolvm_bin" machine exec --name "$machine" -- sh -lc '
 set -eu
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
 
 if ! { test -e /dev/dri/card0 || test -e /dev/dri/renderD128; }; then
   echo "GPU requested but /dev/dri/card0 or /dev/dri/renderD128 is missing" >&2

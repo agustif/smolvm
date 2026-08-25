@@ -681,11 +681,17 @@ protocol = "http"
         assert_eq!(sf.gpu, Some(true));
         assert_eq!(sf.gpu_vram, Some(4096));
         assert!(sf.env.iter().any(|env| env == "LIBSEAT_BACKEND=seatd"));
-        assert!(sf
-            .cmd
-            .iter()
-            .any(|cmd| cmd.contains("weston") && cmd.contains("drm-backend.so")));
-        assert!(sf.cmd.iter().any(|cmd| cmd.contains("VK_ICD_FILENAMES")));
+        assert!(sf.env.iter().any(|env| env.contains("/usr/sbin")));
+        let command = sf.cmd.join("\n");
+        assert!(command.contains("weston"));
+        assert!(command.contains("--backend=drm"));
+        assert!(command.contains("--renderer=pixman"));
+        assert!(command.contains("--socket=wayland-0"));
+        assert!(
+            !command.contains("--tty="),
+            "Fedora Weston invocation must not pass a tty flag"
+        );
+        assert!(command.contains("VK_ICD_FILENAMES"));
 
         let init = sf.dev.expect("fedora-venus dev profile").init.join("\n");
         for expected in [
