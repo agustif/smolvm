@@ -556,12 +556,14 @@ async fn run_bridge(
                     y,
                     button_mask,
                 } => {
-                    clients.entry(client_id).or_default().pointer.send(
-                        x,
-                        y,
-                        button_mask,
-                        &pointer_tx,
-                    );
+                    let client = clients.entry(client_id).or_default();
+                    // Screen Sharing often drops key-up. A held VNC key plus
+                    // Linux autorepeat floods the tty (`$$$$$…`). Clicking
+                    // is a good moment to clear stuck keys.
+                    if button_mask != 0 {
+                        client.release_keys(&keyboard_tx);
+                    }
+                    client.pointer.send(x, y, button_mask, &pointer_tx);
                 }
                 _ => {}
             }
@@ -921,17 +923,45 @@ struct ClientInputState {
 
 impl ClientInputState {
     fn send_key(&mut self, code: u16, down: bool, sender: &PollableChannelSender<InputEvent>) {
-        let changed = if down {
-            self.keys.insert(code)
-        } else {
-            self.keys.remove(&code)
-        };
-        if changed {
+        if is_hold_key(code) {
+            let changed = if down {
+                self.keys.insert(code)
+            } else {
+                self.keys.remove(&code)
+            };
+            if changed {
+                let _ = sender.send_many([
+                    input_event(EV_KEY, code, u32::from(down)),
+                    input_event(EV_SYN, SYN_REPORT, 0),
+                ]);
+            }
+            return;
+        }
+        // Screen Sharing often sends key-down without key-up. Weston then
+        // autorepeats (`$$$$$…`). Pulse non-modifiers so a lost up cannot
+        // stick. Held keys still type because the viewer repeats downs.
+        if down {
             let _ = sender.send_many([
-                input_event(EV_KEY, code, u32::from(down)),
+                input_event(EV_KEY, code, 1),
+                input_event(EV_SYN, SYN_REPORT, 0),
+                input_event(EV_KEY, code, 0),
                 input_event(EV_SYN, SYN_REPORT, 0),
             ]);
+            self.keys.remove(&code);
         }
+    }
+
+    fn release_keys(&mut self, keyboard: &PollableChannelSender<InputEvent>) {
+        if self.keys.is_empty() {
+            return;
+        }
+        let mut events: Vec<_> = self
+            .keys
+            .drain()
+            .map(|code| input_event(EV_KEY, code, 0))
+            .collect();
+        events.push(input_event(EV_SYN, SYN_REPORT, 0));
+        let _ = keyboard.send_many(events);
     }
 
     fn release_all(
@@ -939,15 +969,7 @@ impl ClientInputState {
         keyboard: &PollableChannelSender<InputEvent>,
         pointer: &PollableChannelSender<InputEvent>,
     ) {
-        if !self.keys.is_empty() {
-            let mut events: Vec<_> = self
-                .keys
-                .drain()
-                .map(|code| input_event(EV_KEY, code, 0))
-                .collect();
-            events.push(input_event(EV_SYN, SYN_REPORT, 0));
-            let _ = keyboard.send_many(events);
-        }
+        self.release_keys(keyboard);
         self.pointer.release_all(pointer);
     }
 }
@@ -958,6 +980,10 @@ fn input_event(event_type: u16, code: u16, value: u32) -> InputEvent {
         code,
         value,
     }
+}
+
+fn is_hold_key(code: u16) -> bool {
+    matches!(code, 29 | 42 | 54 | 56 | 97 | 100)
 }
 
 fn keysym_to_linux(keysym: u32) -> Option<u16> {
@@ -1190,7 +1216,7 @@ mod tests {
         let (pointer_tx, pointer_rx) = pollable_channel().unwrap();
         let mut client = ClientInputState::default();
 
-        client.send_key(30, true, &keyboard_tx);
+        client.send_key(42, true, &keyboard_tx);
         client.pointer.send(10, 20, 1, &pointer_tx);
         while keyboard_rx.try_recv().unwrap().is_some() {}
         while pointer_rx.try_recv().unwrap().is_some() {}
@@ -1199,7 +1225,7 @@ mod tests {
         let key_release = keyboard_rx.try_recv().unwrap().unwrap();
         assert_eq!(
             (key_release.type_, key_release.code, key_release.value),
-            (EV_KEY, 30, 0)
+            (EV_KEY, 42, 0)
         );
         let pointer_release = pointer_rx.try_recv().unwrap().unwrap();
         assert_eq!(
@@ -1210,5 +1236,30 @@ mod tests {
             ),
             (EV_KEY, BTN_LEFT, 0)
         );
+    }
+
+    #[test]
+    fn printable_keys_pulse_down_and_up() {
+        let (keyboard_tx, keyboard_rx) = pollable_channel().unwrap();
+        let mut client = ClientInputState::default();
+        client.send_key(5, true, &keyboard_tx);
+        let down = keyboard_rx.try_recv().unwrap().unwrap();
+        let down_syn = keyboard_rx.try_recv().unwrap().unwrap();
+        let up = keyboard_rx.try_recv().unwrap().unwrap();
+        let up_syn = keyboard_rx.try_recv().unwrap().unwrap();
+        assert_eq!((down.type_, down.code, down.value), (EV_KEY, 5, 1));
+        assert_eq!(down_syn.type_, EV_SYN);
+        assert_eq!((up.type_, up.code, up.value), (EV_KEY, 5, 0));
+        assert_eq!(up_syn.type_, EV_SYN);
+        assert!(client.keys.is_empty());
+        assert!(keyboard_rx.try_recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn dollar_keysym_maps_to_key_4() {
+        assert_eq!(keysym_to_linux(0x0024), Some(5));
+        assert_eq!(keysym_to_linux(b'4' as u32), Some(5));
+        assert!(is_hold_key(42));
+        assert!(!is_hold_key(5));
     }
 }

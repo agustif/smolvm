@@ -71,7 +71,11 @@ fn gpu_virgl_flags(software_only: bool) -> u32 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        (1 << 6) | (1 << 7) | (1 << 10)
+        // Venus + no virgl (no EGL on macOS) + thread-sync + DRM.
+        // bit 8 ASYNC_FENCE_CB still fails virgl_renderer_init on this
+        // host (no eventfd; THREAD_SYNC is stripped). Fence retirement
+        // is implemented in patched libvirglrenderer instead.
+        (1 << 1) | (1 << 6) | (1 << 7) | (1 << 10)
     }
 }
 
@@ -110,9 +114,13 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn gpu_flags_enable_macos_venus_no_virgl_and_drm() {
         let flags = gpu_virgl_flags(false);
+        const VIRGLRENDERER_ASYNC_FENCE_CB: u32 = 1 << 8;
+        const VIRGLRENDERER_THREAD_SYNC: u32 = 1 << 1;
         assert_ne!(flags & VIRGLRENDERER_VENUS, 0);
         assert_ne!(flags & VIRGLRENDERER_NO_VIRGL, 0);
         assert_ne!(flags & VIRGLRENDERER_DRM, 0);
+        assert_ne!(flags & VIRGLRENDERER_THREAD_SYNC, 0);
+        assert_eq!(flags & VIRGLRENDERER_ASYNC_FENCE_CB, 0);
         assert_eq!(flags & SMOLVM_GPU_2D_DISPLAY, 0);
     }
 

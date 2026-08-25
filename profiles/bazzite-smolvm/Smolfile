@@ -1,0 +1,143 @@
+# Bazzite-on-SmolVM: Fedora 42 aarch64 + Venus + Weston.
+#
+# Official ghcr.io/ublue-os/bazzite is linux/amd64 ostree and cannot execute
+# in an Apple Silicon libkrun guest. This profile is the aarch64 port that
+# actually paints on RFB/local-shm.
+#
+#   smolvm machine create --name bazzite \
+#     --graphics --renderer venus --transport rfb \
+#     -s smolvm/Smolfile
+#   smolvm machine start --name bazzite
+
+image = "fedora:42"
+entrypoint = ["/bin/sh", "-lc"]
+cmd = ["""
+set -eu
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+rm -rf /tmp/weston-runtime
+install -d -m 700 /tmp/weston-runtime
+install -d -m 1777 /tmp/.X11-unix
+if test -z "${VK_ICD_FILENAMES:-}" && test -z "${VK_DRIVER_FILES:-}"; then
+  arch="$(uname -m)"
+  if test "$arch" = "arm64"; then
+    arch="aarch64"
+  fi
+  for icd in \
+    "/usr/share/vulkan/icd.d/virtio_icd.$arch.json" \
+    /usr/share/vulkan/icd.d/virtio_icd.aarch64.json \
+    /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do
+    if test -r "$icd"; then
+      export VK_ICD_FILENAMES="$icd"
+      break
+    fi
+  done
+fi
+exec dbus-run-session -- weston \
+  --backend=drm \
+  --renderer=pixman \
+  --socket=wayland-0 \
+  --current-mode \
+  --idle-time=0 \
+  --xwayland \
+  --config=/etc/xdg/weston/weston.ini \
+  --log=/var/log/weston.log
+"""]
+env = [
+    "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+    "XDG_RUNTIME_DIR=/tmp/weston-runtime",
+    "LIBSEAT_BACKEND=seatd",
+    "SEATD_SOCK=/run/seatd.sock",
+    "BAZZITE_VARIANT=smolvm-aarch64",
+]
+
+cpus = 4
+memory = 8192
+storage = 40
+overlay = 16
+net = true
+gpu = true
+gpu_vram = 4096
+
+[dev]
+init = [
+    """export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+set -eu
+arch="$(uname -m)"
+if test "$arch" = arm64; then arch=aarch64; fi
+need_pkgs=0
+command -v weston >/dev/null 2>&1 || need_pkgs=1
+command -v vulkaninfo >/dev/null 2>&1 || need_pkgs=1
+test -r "/usr/share/vulkan/icd.d/virtio_icd.$arch.json" -o -r /usr/share/vulkan/icd.d/virtio_icd.aarch64.json || need_pkgs=1
+if test "$need_pkgs" = 1; then
+  dnf -y install dnf-plugins-core
+  if test "$arch" = aarch64; then
+    dnf copr enable -y slp/mesa-libkrun-vulkan
+  fi
+  dnf install -y --allowerasing \
+    weston xorg-x11-server-Xwayland dbus-daemon dejavu-sans-fonts \
+    adwaita-icon-theme mesa-dri-drivers mesa-vulkan-drivers vulkan-tools \
+    libinput curl
+  dnf install -y gamescope || true
+  dnf install -y fex-emu fex-emu-utils || true
+  dnf install -y @x86-emulation || true
+fi
+if test -x /usr/sbin/vulkaninfo && test ! -x /usr/bin/vulkaninfo; then
+  ln -sf /usr/sbin/vulkaninfo /usr/bin/vulkaninfo
+fi
+if test -x /usr/sbin/weston && test ! -x /usr/bin/weston; then
+  ln -sf /usr/sbin/weston /usr/bin/weston
+fi
+install -d -m 755 /usr/share/backgrounds /etc/xdg/weston /usr/local/bin
+if test ! -s /usr/share/backgrounds/bazzite-convergence.png; then
+  curl -fsSL -o /usr/share/backgrounds/bazzite-convergence.png \
+    https://raw.githubusercontent.com/ublue-os/bazzite/main/press_kit/art/Convergence_Wallpaper.png \
+    || true
+fi
+cat > /etc/xdg/weston/weston.ini <<'INI'
+[core]
+idle-time=0
+[shell]
+locking=false
+allow-zap=true
+panel-position=bottom
+background-color=0xff0b0b14
+background-image=/usr/share/backgrounds/bazzite-convergence.png
+background-type=scale-crop
+startup=/usr/local/bin/bazzite-smolvm-session
+INI
+cat > /usr/local/bin/bazzite-smolvm-session <<'SESSION'
+#!/bin/sh
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+if command -v weston-terminal >/dev/null 2>&1; then
+  weston-terminal --shell=/usr/local/bin/bazzite-smolvm-motd &
+fi
+if command -v gamescope >/dev/null 2>&1; then
+  printf '%s\\n' "gamescope is installed (nested Steam session is a follow-up)" >/tmp/bazzite-smolvm.gamescope
+fi
+SESSION
+cat > /usr/local/bin/bazzite-smolvm-motd <<'MOTD'
+#!/bin/sh
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+echo
+echo "  Bazzite on SmolVM (aarch64 + Virtio-GPU Venus)"
+echo "  Upstream Bazzite is x86_64 ostree; this guest is the libkrun port."
+echo
+uname -m
+command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary 2>/dev/null | sed -n '1,40p'
+echo
+exec /bin/bash
+MOTD
+chmod 0755 /usr/local/bin/bazzite-smolvm-session /usr/local/bin/bazzite-smolvm-motd
+""",
+]
+
+[health]
+exec = [
+    "sh",
+    "-lc",
+    "export PATH=\"/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}\"; if test -z \"${VK_ICD_FILENAMES:-}\" && test -z \"${VK_DRIVER_FILES:-}\"; then arch=\"$(uname -m)\"; if test \"$arch\" = arm64; then arch=aarch64; fi; for icd in \"/usr/share/vulkan/icd.d/virtio_icd.$arch.json\" /usr/share/vulkan/icd.d/virtio_icd.aarch64.json /usr/share/vulkan/icd.d/virtio_icd.x86_64.json; do if test -r \"$icd\"; then export VK_ICD_FILENAMES=\"$icd\"; break; fi; done; fi; test -e /dev/dri/card0 -o -e /dev/dri/renderD128 && test -d /dev/input && find /dev/input -name 'event*' | grep -q . && test -S /run/seatd.sock && { test -S /tmp/weston-runtime/wayland-0 -o -S /run/user/0/wayland-0 -o -S /run/wayland-0; } && command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/tmp/smolvm-vulkaninfo.summary 2>&1",
+]
+interval = "10s"
+timeout = "8s"
+retries = 36
+startup_grace = "30s"

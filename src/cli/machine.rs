@@ -2925,6 +2925,10 @@ pub struct DisplayCmd {
     /// Print the credential-bearing endpoint as JSON for a local client.
     #[arg(long)]
     pub json: bool,
+
+    /// Open a local VNC client against the loopback endpoint (macOS Screen Sharing).
+    #[arg(long)]
+    pub open: bool,
 }
 
 impl DisplayCmd {
@@ -2939,7 +2943,19 @@ impl DisplayCmd {
         let endpoint = smolvm::agent::display::read_endpoint(&self.name)
             .map_err(|error| smolvm::Error::agent("read display endpoint", error))?;
         println!("Display ready on {}:{}", endpoint.host, endpoint.port);
-        println!("Use --json to retrieve credentials for a local display client.");
+        if self.open {
+            let url = format!(
+                "vnc://:{}@{}:{}",
+                endpoint.password, endpoint.host, endpoint.port
+            );
+            std::process::Command::new("open")
+                .arg(&url)
+                .status()
+                .map_err(|error| smolvm::Error::agent("open display endpoint", error.to_string()))?;
+            println!("Opened {url}");
+        } else {
+            println!("Use --json to retrieve credentials, or --open to launch a local viewer.");
+        }
         Ok(())
     }
 }
